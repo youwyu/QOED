@@ -1,0 +1,83 @@
+<mujoco model="right_inspire_hand scene">
+  <!-- <option>
+    <flag multiccd="enable" nativeccd="enable"/>
+  </option> -->
+
+  <!-- <size nstack="300000000"/> -->
+  <size memory="1G"/>
+  
+  <!-- <option integrator="implicitfast" timestep=".001"/> -->
+
+  <custom>
+    <numeric name="robust_xfrc" data="0.004" />
+
+    <numeric name="residual_Goal_W" data="1.0 -1 1" />
+    <numeric name="residual_Goal_X" data="0.0 -1 1" />
+    <numeric name="residual_Goal_Y" data="0.0 -1 1" />
+    <numeric name="residual_Goal_Z" data="0.0 -1 1" />
+  </custom>
+
+  <visual>
+    <quality offsamples="0" shadowsize="8192"/>
+    <global azimuth="180" elevation="-30" offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture name="cube" type="cube"
+              fileup="../shadow_reorient/reorientation_cube_textures/fileup.png"
+              fileback="../shadow_reorient/reorientation_cube_textures/fileback.png"
+              filedown="../shadow_reorient/reorientation_cube_textures/filedown.png"
+              filefront="../shadow_reorient/reorientation_cube_textures/filefront.png"
+              fileleft="../shadow_reorient/reorientation_cube_textures/fileleft.png"
+              fileright="../shadow_reorient/reorientation_cube_textures/fileright.png"/>
+    <material name="cube" texture="cube"/>
+    <texture name="graycube" type="cube"
+            fileup="../shadow_reorient/reorientation_cube_textures/grayup.png"
+             fileback="../shadow_reorient/reorientation_cube_textures/grayback.png"
+             filedown="../shadow_reorient/reorientation_cube_textures/graydown.png"
+             filefront="../shadow_reorient/reorientation_cube_textures/grayfront.png"
+             fileleft="../shadow_reorient/reorientation_cube_textures/grayleft.png"
+             fileright="../shadow_reorient/reorientation_cube_textures/grayright.png"/>
+    <material name="graycube" texture="graycube"/>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <texture name="fawn" file="../../fawn/Enchanted_Fawn_1130192104_texture.png" type="2d"/>
+    <material name="fawn" texture="fawn" specular="1" shininess="1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 -0.1 0.5" dir="0 0.2 -1" diffuse="0.7 0.7 0.7" specular="0.3 0.3 0.3"
+        directional="true" castshadow="true"/>
+    <geom name="floor" pos="0 0 -0.2" size="0 0 0.05" type="plane" material="groundplane"/>
+    <camera name="camera" pos="0 0.1 0.35" axisangle="1 0 0 0" fovy="58"/>
+    <body name="goal" pos="0.325 0.17 0.0475">
+      <joint type="ball" damping="0.01"/>
+      <geom type="box" size=".022 .022 .022" mass=".126" material="cube" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <user name="In Hand" dim="3" user="1 20 0 100 0.02 2"/>
+    <user name="Orientation" dim="3" user="0 10 0 10" />
+    <user name="Cube Vel." dim="3" user="0 10 0 20" />
+    <user name="Actuator" dim="6" user="0 0.1 0.0 1.0" />
+    <user name="Grasp" dim="12" user="0 2.5 0.0 10.0" />
+    <user name="Joint Vel." dim="12" user="0 1.0e-4 0.0 1.0e-1" />
+    <framepos name="palm_position" objtype="site" objname="grasp_site"/>
+    <framequat name="palm_orientation" objtype="site" objname="grasp_site"/>
+    <framequat name="cube_goal_orientation" objtype="body" objname="goal"/>
+  </sensor>
+
+  <include file="FTP_right_hand.xml"/>
+
+  <!-- <keyframe>
+    <key 
+    name="home" 
+    qpos="0 0 0 0 0 0 0 0 -0.16734816 -0.16734803 -0.16734798 -0.167348 -0.08147363 -0.07234851"
+    ctrl="0 0 0 0 0 0"
+    />
+  </keyframe> -->
+</mujoco>

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qoed"
+version = "0.1.0"
+description = "QOED is Quasi-Optimal Experimental Design"
+requires-python = ">=3.10"
+dependencies = [
+  "mujoco",
+  "torch==2.11.0",
+  "torchvision==0.26.0",
+  "tqdm",
+  "wandb[media]",
+]
+
+[project.optional-dependencies]
+mjlab = [
+  "mjlab",
+  "warp-lang<1.13",
+]
+
+[dependency-groups]
+rwm = [
+  "rsl-rl-lib @ git+https://github.com/leggedrobotics/rsl_rl_rwm.git",
+  "mbrl",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+mbrl = { git = "https://github.com/leggedrobotics/robotic_world_model.git", branch = "master", subdirectory = "source/mbrl" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[project.scripts]
+qoed-jackal-demo = "demos.jackal:main"
+qoed-franka-demo = "demos.franka:main"
+
+[tool.setuptools.packages.find]
+include = ["boed*", "demos*", "mbpo*", "sim*"]
