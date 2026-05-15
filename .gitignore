@@ -1,0 +1,41 @@
+# Build products
+/build/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# Training and logging outputs
+runs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.mp4
+*.mov
+*.avi
+logs/
+!logs/
+logs/*
+!logs/rsl_rl/
+logs/rsl_rl/*
+!logs/rsl_rl/go1_velocity/
+logs/rsl_rl/go1_velocity/*
+!logs/rsl_rl/go1_velocity/2000-01-01_00-00-00_pretrain/
+!logs/rsl_rl/go1_velocity/2000-01-01_00-00-00_pretrain/**
+outputs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
