@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import multiprocessing as mp
 import os
@@ -21,6 +22,7 @@ from .utils import (
     ACTIVE_GO1_RGBA,
     GO1_FEET_NAMES,
     apply_go1_domain_randomization,
+    mujoco_actuator_ids_by_joint_type,
     mujoco_body_ids_with_prefix,
     mujoco_geom_ids_with_prefix,
     mujoco_named_id,
@@ -30,15 +32,32 @@ from .utils import (
 
 
 _VIEWER_CLOSE = "__close__"
+_REWARD_WEIGHTS = {
+    "track_linear_velocity": 2.0,
+    "track_angular_velocity": 2.0,
+    "upright": 1.0,
+    "pose": 1.0,
+    "dof_pos_limits": -1.0,
+    "action_rate_l2": -0.1,
+    "air_time": 0.0,
+    "foot_clearance": -2.0,
+    "foot_swing_height": -0.25,
+    "foot_slip": -0.1,
+    "soft_landing": -1.0e-5,
+}
 
 
-def _mujoco_training_viewer_worker(
-    model_path: str,
-    state_queue,
-    follow_camera: bool,
-) -> None:
-    import queue as queue_module
+def _put_latest(state_queue, message) -> None:
+    try:
+        state_queue.put_nowait(message)
+    except queue.Full:
+        with contextlib.suppress(queue.Empty):
+            state_queue.get_nowait()
+        with contextlib.suppress(queue.Full):
+            state_queue.put_nowait(message)
 
+
+def _mujoco_training_viewer_worker(model_path: str, state_queue, follow_camera: bool) -> None:
     import mujoco.viewer
 
     model = mujoco.MjModel.from_binary_path(model_path)
@@ -49,12 +68,12 @@ def _mujoco_training_viewer_worker(
     def latest_message():
         try:
             message = state_queue.get(timeout=1.0 / 60.0)
-        except queue_module.Empty:
+        except queue.Empty:
             return None
         while True:
             try:
                 message = state_queue.get_nowait()
-            except queue_module.Empty:
+            except queue.Empty:
                 return message
 
     with mujoco.viewer.launch_passive(model, data) as handle:
@@ -161,9 +180,12 @@ class DirectMujocoGo1VecEnv(VecEnv):
         self._robot_dof_ids = self.mujoco_go1.obs_dof_adrs
         self._robot_qpos_ids = self.mujoco_go1.obs_qpos_adrs
         self._torso_body_id = mujoco_named_id(self.model, mujoco.mjtObj.mjOBJ_BODY, "robot/trunk")
-        self._domain_randomization_enabled = os.environ.get("QOED_GO1_DOMAIN_RANDOMIZATION") == "1"
+        self._actuator_type_ids = mujoco_actuator_ids_by_joint_type(self.model)
+        self._payload = 0.0
         self._model_defaults = save_mujoco_model_defaults(self.model)
         self._refresh_domain_randomization_cache()
+        if os.environ.get("QOED_GO1_DOMAIN_RANDOMIZATION") == "1":
+            self._apply_domain_randomization()
 
         self._viewer_mode = viewer
         self._follow_camera = follow_camera
@@ -219,10 +241,7 @@ class DirectMujocoGo1VecEnv(VecEnv):
             self._episode_metric_sums[name] = self._episode_metric_sums.get(name, 0.0) + value
         self._episode_metric_count += 1
 
-        extras = {
-            "time_outs": torch.tensor([False], dtype=torch.bool, device=self.device),
-            "domain_randomization": self.domain_randomization_vector(),
-        }
+        extras = {"time_outs": torch.tensor([False], dtype=torch.bool, device=self.device)}
         if done:
             extras["episode"] = self._episode_log(fell_over=fell_over, time_out=False)
             self._reset_robot()
@@ -246,34 +265,16 @@ class DirectMujocoGo1VecEnv(VecEnv):
         self._viewer_model_path = None
 
         if state_queue is not None:
-            try:
-                state_queue.put_nowait(_VIEWER_CLOSE)
-            except queue.Full:
-                try:
-                    state_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    state_queue.put_nowait(_VIEWER_CLOSE)
-                except queue.Full:
-                    pass
+            _put_latest(state_queue, _VIEWER_CLOSE)
         if process is not None:
             process.join(timeout=1.0)
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=1.0)
         if model_path is not None:
-            try:
-                os.unlink(model_path)
-            except FileNotFoundError:
-                pass
-
-        if state_queue is None:
-            return
-        try:
+            os.unlink(model_path)
+        if state_queue is not None:
             state_queue.close()
-        except Exception as exc:
-            print(f"[WARN] Failed to close MuJoCo training viewer queue cleanly: {exc}")
 
     def domain_randomization_vector(self) -> torch.Tensor:
         vector = np.concatenate(
@@ -282,6 +283,9 @@ class DirectMujocoGo1VecEnv(VecEnv):
                 self._body_mass,
                 self._dof_frictionloss,
                 self._dof_armature,
+                self._kp_scale,
+                self._kd_scale,
+                np.asarray([self._payload], dtype=np.float32),
             ),
             axis=0,
         )
@@ -311,7 +315,7 @@ class DirectMujocoGo1VecEnv(VecEnv):
         self._imagination_term_sums: dict[str, torch.Tensor] = {}
         self._imagination_metric_sums: dict[str, torch.Tensor] = {}
         self._imagination_metric_count = torch.zeros(num_envs, device=device)
-        self._reset_imagination_indices(torch.arange(num_envs, device=device), log=False)
+        self._reset_imagination_indices(torch.arange(num_envs, device=device))
         return None
 
     def get_imagination_observation(self, state_history, action_history):
@@ -336,14 +340,10 @@ class DirectMujocoGo1VecEnv(VecEnv):
             terminations,
         ) = self.system_dynamics.forward(state_history, action_history, self._imagination_model_ids)
         next_state_denormalized = self.imagination_state_normalizer.inverse(next_state)
-        contact = self._parse_imagination_contact(contacts)
+        self._parse_imagination_contact(contacts)
         termination = self._parse_imagination_termination(terminations, next_state_denormalized)
 
-        rewards, reward_terms, metrics = self._compute_imagination_reward(
-            next_state_denormalized,
-            rollout_action,
-            contact,
-        )
+        rewards, reward_terms, metrics = self._compute_imagination_reward(next_state_denormalized, rollout_action)
         self._imagination_last_action = rollout_action.detach()
         self._imagination_episode_length_buf += 1
         self.common_step_counter += 1
@@ -358,7 +358,7 @@ class DirectMujocoGo1VecEnv(VecEnv):
         reset_ids = dones_bool.nonzero(as_tuple=False).flatten()
         if reset_ids.numel() > 0:
             extras["log"] = self._imagination_episode_log(reset_ids, termination, time_outs)
-            self._reset_imagination_indices(reset_ids, log=False)
+            self._reset_imagination_indices(reset_ids)
 
         obs = self._imagination_obs_from_state(next_state_denormalized, rollout_action, termination)
         state_history = torch.cat([state_history[:, 1:], next_state.unsqueeze(1)], dim=1)
@@ -368,8 +368,7 @@ class DirectMujocoGo1VecEnv(VecEnv):
         if not hasattr(self, "_imagination_command"):
             self.prepare_imagination()
 
-    def _reset_imagination_indices(self, env_ids: torch.Tensor, log: bool = True) -> None:
-        del log
+    def _reset_imagination_indices(self, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0:
             return
         env_ids = env_ids.to(self._imagination_device, dtype=torch.long)
@@ -496,15 +495,16 @@ class DirectMujocoGo1VecEnv(VecEnv):
             termination = torch.sigmoid(terminations).reshape(state.shape[0], -1).max(dim=1).values > 0.5
         projected_gravity = state[:, 6:9]
         bad_orientation = torch.acos(torch.clamp(-projected_gravity[:, 2], -1.0, 1.0)).abs() > math.radians(70.0)
-        return termination | bad_orientation
+        low, high = torch.as_tensor(self._joint_limits, device=state.device, dtype=state.dtype).unbind(1)
+        joint_pos = state[:, 9:21] + torch.as_tensor(self.mujoco_go1.default_joint_pos, device=state.device, dtype=state.dtype)
+        plausible = ((joint_pos >= 2 * low - high) & (joint_pos <= 2 * high - low)).all(dim=1) & torch.isfinite(state).all(dim=1)
+        return termination | bad_orientation | ~plausible
 
     def _compute_imagination_reward(
         self,
         state: torch.Tensor,
         action: torch.Tensor,
-        contact: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        del contact
         base_lin_vel = state[:, 0:3]
         base_ang_vel = state[:, 3:6]
         projected_gravity = state[:, 6:9]
@@ -552,23 +552,7 @@ class DirectMujocoGo1VecEnv(VecEnv):
             "foot_slip": zero,
             "soft_landing": zero,
         }
-        weights = {
-            "track_linear_velocity": 2.0,
-            "track_angular_velocity": 2.0,
-            "upright": 1.0,
-            "pose": 1.0,
-            "dof_pos_limits": -1.0,
-            "action_rate_l2": -0.1,
-            "air_time": 0.0,
-            "foot_clearance": -2.0,
-            "foot_swing_height": -0.25,
-            "foot_slip": -0.1,
-            "soft_landing": -1.0e-5,
-        }
-        weighted_terms = {
-            name: float(weights[name]) * value * self.step_dt
-            for name, value in raw_terms.items()
-        }
+        weighted_terms = {name: float(_REWARD_WEIGHTS[name]) * value * self.step_dt for name, value in raw_terms.items()}
         reward = torch.stack(tuple(weighted_terms.values()), dim=0).sum(dim=0)
         metrics = {
             "Metrics/twist/error_vel_xy": torch.linalg.norm(command[:, :2] - base_lin_vel[:, :2], dim=1),
@@ -618,8 +602,6 @@ class DirectMujocoGo1VecEnv(VecEnv):
         return log
 
     def _reset_robot(self) -> None:
-        if self._domain_randomization_enabled:
-            self._apply_domain_randomization()
         self.mujoco_go1.reset()
         self.prev_contact[:] = False
         self.contact[:] = False
@@ -641,11 +623,15 @@ class DirectMujocoGo1VecEnv(VecEnv):
     def _refresh_domain_randomization_cache(self) -> None:
         self._floor_friction = float(self.model.geom_friction[self.terrain_geom_id, 0])
         self._body_mass = self.model.body_mass[self._robot_body_ids].astype(np.float32).copy()
+        self._body_mass[self._robot_body_ids.index(self._torso_body_id)] -= self._payload
         self._dof_frictionloss = self.model.dof_frictionloss[self._robot_dof_ids].astype(np.float32).copy()
         self._dof_armature = self.model.dof_armature[self._robot_dof_ids].astype(np.float32).copy()
+        defaults = self._model_defaults
+        self._kp_scale = np.asarray([(self.model.actuator_gainprm[ids, 0] / defaults.actuator_gainprm[ids, 0]).mean() for ids in self._actuator_type_ids], dtype=np.float32)
+        self._kd_scale = np.asarray([(self.model.actuator_biasprm[ids, 2] / defaults.actuator_biasprm[ids, 2]).mean() for ids in self._actuator_type_ids], dtype=np.float32)
 
     def _apply_domain_randomization(self) -> None:
-        apply_go1_domain_randomization(
+        self._payload = apply_go1_domain_randomization(
             self.model,
             self.data,
             self.rng,
@@ -655,6 +641,7 @@ class DirectMujocoGo1VecEnv(VecEnv):
             torso_body_id=self._torso_body_id,
             body_mass_ids=self._robot_body_ids,
             robot_qpos_ids=self._robot_qpos_ids,
+            actuator_type_ids=self._actuator_type_ids,
             dtype=np.float32,
         )
         self._refresh_domain_randomization_cache()
@@ -662,22 +649,18 @@ class DirectMujocoGo1VecEnv(VecEnv):
     def _open_viewer(self) -> None:
         if self._viewer_mode != "native":
             return
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".mjb", delete=False) as model_file:
-                self._viewer_model_path = model_file.name
-            mujoco.mj_saveModel(self.model, self._viewer_model_path)
-            context = mp.get_context("fork")
-            self._viewer_queue = context.Queue(maxsize=2)
-            self._viewer_process = context.Process(
-                target=_mujoco_training_viewer_worker,
-                args=(self._viewer_model_path, self._viewer_queue, self._follow_camera),
-                daemon=True,
-            )
-            self._viewer_process.start()
-            self._publish_viewer_state()
-        except Exception as exc:
-            self.close()
-            print(f"[WARN] Failed to launch MuJoCo training viewer; continuing headless: {exc}")
+        with tempfile.NamedTemporaryFile(suffix=".mjb", delete=False) as model_file:
+            self._viewer_model_path = model_file.name
+        mujoco.mj_saveModel(self.model, self._viewer_model_path)
+        context = mp.get_context("fork")
+        self._viewer_queue = context.Queue(maxsize=2)
+        self._viewer_process = context.Process(
+            target=_mujoco_training_viewer_worker,
+            args=(self._viewer_model_path, self._viewer_queue, self._follow_camera),
+            daemon=True,
+        )
+        self._viewer_process.start()
+        self._publish_viewer_state()
 
     def _publish_viewer_state(self) -> None:
         if self._viewer_process is None or self._viewer_queue is None:
@@ -685,23 +668,8 @@ class DirectMujocoGo1VecEnv(VecEnv):
         if not self._viewer_process.is_alive():
             self.close()
             return
-        message = (
-            self.data.qpos.copy(),
-            self.data.qvel.copy(),
-            self.data.ctrl.copy(),
-            self.command.copy(),
-        )
-        try:
-            self._viewer_queue.put_nowait(message)
-        except queue.Full:
-            try:
-                self._viewer_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._viewer_queue.put_nowait(message)
-            except queue.Full:
-                pass
+        message = (self.data.qpos.copy(), self.data.qvel.copy(), self.data.ctrl.copy(), self.command.copy())
+        _put_latest(self._viewer_queue, message)
 
     def _throttle_viewer_step(self) -> None:
         if self._viewer_step_period <= 0.0:
@@ -798,19 +766,7 @@ class DirectMujocoGo1VecEnv(VecEnv):
             "foot_slip": foot_slip,
             "soft_landing": soft_landing,
         }
-        weights = {
-            "track_linear_velocity": 2.0,
-            "track_angular_velocity": 2.0,
-            "upright": 1.0,
-            "pose": 1.0,
-            "dof_pos_limits": -1.0,
-            "action_rate_l2": -0.1,
-            "air_time": 0.0,
-            "foot_clearance": -2.0,
-            "foot_swing_height": -0.25,
-            "foot_slip": -0.1,
-            "soft_landing": -1.0e-5,
-        }
+        weights = dict(_REWARD_WEIGHTS)
         for name, cfg in getattr(self.cfg, "rewards", {}).items():
             if name in weights:
                 weights[name] = float(cfg.weight)

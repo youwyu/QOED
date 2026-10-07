@@ -10,25 +10,29 @@
   <a href="https://arxiv.org/abs/2605.12084"><img src="https://img.shields.io/badge/arXiv-2605.12084-red" alt="arXiv Preprint"></a>
 </p>
 
-![QOED teaser](boed/teaser.png)
-
 ## Installation
 
 Install the base package. You can run [Experiment 1](#experiment-1-quick-demos-of-jackal-and-franka) after this step.
 
 ```bash
-conda create -n qoed python=3.11 -y
+conda create -n qoed python=3.12 -y
 conda activate qoed
 conda install conda-forge::uv -y
-uv pip install -e . --no-cache-dir
+uv pip install -e . --no-cache
 ```
 
 Install the [MJLab](https://github.com/mujocolab/mjlab) and [RWM](https://github.com/leggedrobotics/robotic_world_model) dependencies. You can run [Experiment 2](#experiment-2-model-based-policy-optimization) after this step.
 
 ```bash
-uv pip install -e ".[mjlab]" --reinstall-package warp-lang --no-cache-dir
-uv pip install --group rwm --no-deps --reinstall-package rsl-rl-lib --reinstall-package mbrl --no-cache-dir
+uv pip install -e ".[mjlab]" --no-cache
 ```
+
+## Roadmap
+
+- [x] RSS experiments: Jackal, Franka, Go1-Quadruped
+- [x] Code optimization, e.g., torch.compile() or JAX
+- [ ] Additional demos, e.g., next-best-view or differentiable MPC
+- [ ] Additional robot platforms, e.g., G1-Humanoid, Inspire-Hand
 
 ## Experiment 1. Quick Demos of Jackal and Franka
 
@@ -43,17 +47,21 @@ qoed-jackal-demo --device cuda:0 --sweep
 qoed-franka-demo --device cuda:0 --sweep
 ```
 
+`--sweep` runs 10 seeds per method and prints the paper summary.
+
+![QOED vs. QOED-Agnostic and BOED on the Jackal and Franka demos](boed/qoed_demo.gif)
+
 ## Experiment 2. Model-based Policy Optimization
 
 > [!IMPORTANT]
-> Requires VRAM >= 12GB
+> Requires VRAM >= 8GB
 
-#### 2.1 Pretrain in Simulation
+#### 2.1 Pretrain in Simulation (ETA: 1 hour)
 
 Optional: train the dynamics model and policy. A pretrained checkpoint is provided under `logs/`.
 
 ```bash
-python mbpo/rsl_rl/train.py --task go1 --mode pretrain --domain_randomization --gpu-ids "[0, ]" --headless
+python mbpo/rsl_rl/train.py --task go1 --mode pretrain --gpu-ids "[0, ]" --headless
 ```
 
 Optional: play the pretrained policy in MuJoCo.
@@ -64,20 +72,13 @@ python mbpo/rsl_rl/play.py --task go1 --mode pretrain --gpu-ids "[0, ]" --viewer
 
 #### 2.2 Online Learning
 
-Run real-world online RL, using MuJoCo as the real-system proxy.
+Run real-world online RL, using MuJoCo as the real-system proxy. Each run draws the robot's PD gains and payload from the prior, and the info-gain mode decides how the robot explores to identify them.
 
 ```bash
 python mbpo/rsl_rl/train.py --task go1 --mode finetune --info-gain qoed --gpu-ids "[0, ]" --viewer auto
 ```
 
 Available info-gain modes: `qoed`, `qoed-agnostic`, `boed`, and `nothing`.
-
-## Roadmap
-
-- [x] RSS experiments: Jackal, Franka, Go1-Quadruped
-- [ ] Code optimization, e.g., torch.compile() or JAX
-- [ ] Additional demos, e.g., next-best-view or differentiable MPC
-- [ ] Additional robot platforms, e.g., G1-Humanoid, Inspire-Hand
 
 ## Miscell
 Please consider cite our work if it is interesting.

@@ -18,12 +18,6 @@ from .utils import (
 )
 
 
-def _strip_robot_prefix(name: str | None) -> str:
-    if not name:
-        return ""
-    return name.removeprefix("robot/")
-
-
 def _resolve_name_values(
     values: float | int | dict[str, float],
     names: list[str],
@@ -31,15 +25,12 @@ def _resolve_name_values(
 ) -> np.ndarray:
     if isinstance(values, (float, int)):
         return np.full(len(names), float(values), dtype=np.float32)
-    if not isinstance(values, dict):
-        raise TypeError(f"Unsupported action scale type: {type(values).__name__}")
-
     resolved = np.full(len(names), float(default), dtype=np.float32)
     matched = np.zeros(len(names), dtype=bool)
     for pattern, value in values.items():
         regex = re.compile(pattern)
         for index, name in enumerate(names):
-            if regex.fullmatch(name) or regex.match(name):
+            if regex.match(name):
                 resolved[index] = float(value)
                 matched[index] = True
     if not bool(matched.all()):
@@ -156,8 +147,6 @@ def _add_arrow(
 class PureMujocoGo1Model:
     """Single-Go1 MuJoCo model with MJLab-compatible observations/actions."""
 
-    _ACTIVE_RGBA = ACTIVE_GO1_RGBA
-
     def __init__(self, env_cfg) -> None:
         env_cfg.scene.num_envs = 1
         self.scene = Scene(env_cfg.scene, device="cpu")
@@ -201,13 +190,12 @@ class PureMujocoGo1Model:
         self.ctrl_action_indices = np.empty(self.model.nu, dtype=np.int32)
         for ctrl_id in range(self.model.nu):
             joint_id = int(self.model.actuator_trnid[ctrl_id, 0])
-            full_joint_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
-            joint_name = _strip_robot_prefix(full_joint_name)
+            joint_name = (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id) or "").removeprefix("robot/")
             self.ctrl_action_indices[ctrl_id] = action_name_to_index[joint_name]
         self.default_ctrl = self.default_action_joint_pos[self.ctrl_action_indices].astype(np.float64)
 
-        self.lin_vel_slice = self._sensor_slice("robot/imu_lin_vel")
-        self.ang_vel_slice = self._sensor_slice("robot/imu_ang_vel")
+        self.lin_vel_slice = mujoco_sensor_slice(self.model, "robot/imu_lin_vel")
+        self.ang_vel_slice = mujoco_sensor_slice(self.model, "robot/imu_ang_vel")
         self.last_action = np.zeros(self.action_dim, dtype=np.float32)
 
         self.robot_geom_ids = mujoco_geom_ids_with_prefix(self.model, "robot/")
@@ -221,9 +209,6 @@ class PureMujocoGo1Model:
     def _joint_dofadr(self, joint_name: str) -> int:
         joint_id = mujoco_named_id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"robot/{joint_name}")
         return int(self.model.jnt_dofadr[joint_id])
-
-    def _sensor_slice(self, sensor_name: str) -> slice:
-        return mujoco_sensor_slice(self.model, sensor_name)
 
     def reset(self) -> None:
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
@@ -275,12 +260,8 @@ class PureMujocoGo1Model:
         return bool(angle > np.deg2rad(70.0))
 
     def set_active_color(self, active: bool) -> None:
-        if not self.robot_geom_ids:
-            return
-        if active:
-            self.model.geom_rgba[self.robot_geom_ids] = self._ACTIVE_RGBA
-        else:
-            self.model.geom_rgba[self.robot_geom_ids] = self.default_robot_rgba
+        if self.robot_geom_ids:
+            self.model.geom_rgba[self.robot_geom_ids] = ACTIVE_GO1_RGBA if active else self.default_robot_rgba
 
     def update_camera(self, camera) -> None:
         set_go1_camera(camera, self.data.qpos)

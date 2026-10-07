@@ -9,7 +9,7 @@ obs_groups:
 save_interval: 50
 experiment_name: go1_velocity
 run_name: pretrain
-logger: wandb
+logger: tensorboard
 wandb_project: mjlab
 wandb_tags: !!python/tuple []
 resume: false

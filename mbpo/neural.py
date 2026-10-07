@@ -1,20 +1,12 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.func import jvp
+from torch.utils.checkpoint import checkpoint
 
-
-def uses_flow(backbone: str) -> bool:
-    return backbone in {"flow", "shortcut"}
-
-
-def _exists(x) -> bool:
-    return x is not None
+EVAL_CHUNK_ROWS = 2048
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -42,7 +34,7 @@ class TimestepEncoder(nn.Module):
         hidden = int(embed_dim * mlp_ratio)
         self.net = nn.Sequential(nn.Linear(in_dim, hidden), nn.Mish(), nn.Linear(hidden, embed_dim))
 
-    def forward(self, t1: torch.Tensor, t2: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, t1: torch.Tensor, t2: torch.Tensor | None = None) -> torch.Tensor:
         emb = self.pos(t1)
         if self.dual:
             emb = torch.cat([emb, self.pos(t1 if t2 is None else t2)], dim=-1)
@@ -192,7 +184,7 @@ class DiffusionTransformer(nn.Module):
         cond_t = torch.cat(cond, dim=-1)
         x = torch.cat([next_embed, self.registers.expand(batch, -1, -1)], dim=1) + self.pos_embed
         for block in self.blocks:
-            x = block(x, cond_t)
+            x = checkpoint(block, x, cond_t, use_reentrant=False) if torch.is_grad_enabled() else block(x, cond_t)
         out = self.state_decoder(self.final(x, cond_t)[:, :1])
         return out[:, 0] if next_is_flat else out
 
@@ -249,11 +241,6 @@ class ShortcutModel(nn.Module):
         self.prior_loc = nn.Parameter(torch.zeros(state_dim))
         self.prior_scale = nn.Parameter(torch.ones(state_dim))
 
-    @property
-    def prior(self):
-        scale = self.prior_scale.clamp_min(1e-6)
-        return torch.distributions.Independent(torch.distributions.Normal(self.prior_loc, scale), 1)
-
     def loss(self, next_state: torch.Tensor, state: torch.Tensor, action: torch.Tensor | None = None, privilege: torch.Tensor | None = None) -> torch.Tensor:
         t, dt, n_sc = self.ts_sampler.sample_t(next_state.shape[0], next_state.device)
         x1 = next_state.unsqueeze(1) if next_state.ndim == 2 else next_state
@@ -277,99 +264,25 @@ class ShortcutModel(nn.Module):
             loss = loss + F.mse_loss(target[:n_sc], pred[:n_sc])
         return loss
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor | None = None, privilege: torch.Tensor | None = None, n_step: int = 1, dt_list: Optional[list[float]] = None) -> torch.Tensor:
-        if not _exists(dt_list):
-            if not _exists(n_step):
-                raise ValueError("n_step or dt_list is required")
-            dt_list = [1.0 / max(int(n_step), 1)] * max(int(n_step), 1)
-        x = torch.randn_like(state)
+    def forward(self, state: torch.Tensor, action: torch.Tensor | None = None, privilege: torch.Tensor | None = None, n_step: int = 1, noise: torch.Tensor | None = None) -> torch.Tensor:
+        n_step = max(int(n_step), 1)
+        x = torch.randn_like(state) if noise is None else noise
         squeeze = x.ndim == 2
         if squeeze:
             x = x.unsqueeze(1)
         t_cur = torch.zeros(state.shape[0], device=state.device, dtype=state.dtype)
-        for dt_val in dt_list:
-            dt = torch.full((state.shape[0],), float(dt_val), device=state.device, dtype=state.dtype)
+        for _ in range(n_step):
+            dt = torch.full((state.shape[0],), 1.0 / n_step, device=state.device, dtype=state.dtype)
             dt_in = dt if self.use_shortcut else torch.zeros_like(dt)
-            x = x + self.flow(x, state, action, privilege, t_cur, t_cur, dt_in, dt_in) * dt[:, None, None]
+            x = x + self._flow(x, state, action, privilege, t_cur, t_cur, dt_in, dt_in) * dt[:, None, None]
             t_cur = t_cur + dt
         return x[:, 0] if squeeze else x
 
-    def sample_and_log_prob(
-        self,
-        state: torch.Tensor,
-        action: torch.Tensor | None = None,
-        privilege: torch.Tensor | None = None,
-        n_step: int = 1,
-        dt_list: Optional[list[float]] = None,
-        num_trace_samples: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        def fn(s):
-            return self.forward(s, action, privilege, n_step, dt_list)
-
-        trace = torch.zeros(state.shape[0], device=state.device, dtype=state.dtype)
-        out = None
-        for _ in range(num_trace_samples):
-            probe = torch.empty_like(state).bernoulli_(0.5).mul_(2).sub_(1)
-            out, jvp_out = jvp(fn, (state,), (probe,))
-            trace = trace + (jvp_out * probe).sum(dim=-1)
-        trace = trace / float(num_trace_samples)
-        return out.detach(), self.prior.log_prob(state) - trace
-
-    @staticmethod
-    def _rank1_eigh(grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        batch, p = grad.shape
-        vals = torch.zeros(batch, p, device=grad.device, dtype=grad.dtype)
-        vecs = torch.eye(p, device=grad.device, dtype=grad.dtype).expand(batch, -1, -1).clone()
-        norm = grad.norm(dim=-1, keepdim=True)
-        valid = norm.squeeze(-1) > 1e-12
-        if valid.any():
-            vals[valid, -1] = norm[valid, 0].square()
-            vecs[valid, :, -1] = grad[valid] / norm[valid]
-        return vals, vecs
-
-    def fisher(
-        self,
-        state: torch.Tensor,
-        action: torch.Tensor | None = None,
-        privilege: torch.Tensor | None = None,
-        n_step: int = 1,
-        dt_list: Optional[list[float]] = None,
-        max_microbatch: int = 512,
-        compute_eigendecomp: bool = True,
-        num_trace_samples: int = 1,
-        eig_on_cpu: bool = True,
-    ):
-        if privilege is None:
-            raise ValueError("privilege is required for Fisher estimation")
-        if privilege.ndim != 3 or privilege.shape[1] != 1:
-            raise ValueError("expected privilege with shape [B, 1, P]")
-        batch, _, p = privilege.shape
-        fisher_vals = torch.zeros(batch, 1, device=state.device, dtype=state.dtype)
-        grads = torch.zeros(batch, p, device=state.device, dtype=state.dtype) if compute_eigendecomp else None
-        flat_priv = privilege[:, 0]
-        with torch.enable_grad():
-            for offset in range(0, batch, max_microbatch):
-                end = min(offset + max_microbatch, batch)
-                priv = flat_priv[offset:end].detach().clone().requires_grad_(True)
-                _, log_q = self.sample_and_log_prob(
-                    state[offset:end].detach(),
-                    None if action is None else action[offset:end].detach(),
-                    priv,
-                    n_step,
-                    dt_list,
-                    num_trace_samples,
-                )
-                (grad,) = torch.autograd.grad(log_q.sum(), priv, retain_graph=False, create_graph=False)
-                fisher_vals[offset:end] = grad.square().sum(dim=-1, keepdim=True)
-                if grads is not None:
-                    grads[offset:end] = grad
-        if not compute_eigendecomp:
-            return fisher_vals, None, None
-        if eig_on_cpu:
-            vals, vecs = self._rank1_eigh(grads.detach().cpu())
-            return fisher_vals, vals.to(state.device, state.dtype), vecs.to(state.device, state.dtype)
-        vals, vecs = self._rank1_eigh(grads)
-        return fisher_vals, vals, vecs
+    def _flow(self, *args):
+        if torch.is_grad_enabled() or args[0].shape[0] <= EVAL_CHUNK_ROWS:
+            return self.flow(*args)
+        rows = range(0, args[0].shape[0], EVAL_CHUNK_ROWS)
+        return torch.cat([self.flow(*(None if a is None else a[i : i + EVAL_CHUNK_ROWS] for a in args)) for i in rows])
 
 
 class FlowDynamics(nn.Module):
@@ -420,12 +333,13 @@ class FlowDynamics(nn.Module):
             return torch.zeros(batch, dim, device=device, dtype=dtype)
         return x.reshape(batch, dim).to(device=device, dtype=dtype)
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor | None = None, privilege: torch.Tensor | None = None, n_step: int = 1) -> torch.Tensor:
+    def forward(self, state: torch.Tensor, action: torch.Tensor | None = None, privilege: torch.Tensor | None = None, n_step: int = 1, noise: torch.Tensor | None = None) -> torch.Tensor:
         batch = state.shape[0]
         state = state.reshape(batch, self.state_dim)
         action = self._feature(action, batch, self.action_dim, state.device, state.dtype)
         privilege = self._feature(privilege, batch, self.privilege_dim, state.device, state.dtype)
-        return self.model(state, action, privilege, n_step=n_step)
+        noise = None if noise is None else noise.reshape(batch, self.state_dim)
+        return self.model(state, action, privilege, n_step=n_step, noise=noise)
 
     def loss(self, next_state: torch.Tensor, state: torch.Tensor, action: torch.Tensor | None = None, privilege: torch.Tensor | None = None) -> torch.Tensor:
         batch = state.shape[0]
@@ -434,30 +348,3 @@ class FlowDynamics(nn.Module):
         action = self._feature(action, batch, self.action_dim, state.device, state.dtype)
         privilege = self._feature(privilege, batch, self.privilege_dim, state.device, state.dtype)
         return self.model.loss(next_state, state, action, privilege)
-
-    def fisher(
-        self,
-        state: torch.Tensor,
-        action: torch.Tensor | None = None,
-        privilege: torch.Tensor | None = None,
-        *,
-        compute_eigendecomp: bool = True,
-        max_microbatch: int = 512,
-        num_trace_samples: int = 1,
-    ):
-        if self.privilege_dim <= 0 or privilege is None or privilege.numel() == 0:
-            batch = state.shape[0]
-            zeros = torch.zeros(batch, 1, device=state.device, dtype=state.dtype)
-            return zeros, None, None
-        batch = state.shape[0]
-        action = self._feature(action, batch, self.action_dim, state.device, state.dtype)
-        privilege = privilege.reshape(batch, 1, self.privilege_dim).to(state.device, state.dtype)
-        return self.model.fisher(
-            state,
-            action,
-            privilege,
-            compute_eigendecomp=compute_eigendecomp,
-            max_microbatch=max_microbatch,
-            num_trace_samples=num_trace_samples,
-            eig_on_cpu=True,
-        )
