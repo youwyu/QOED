@@ -1,4 +1,4 @@
-"""Go1 RSL-RL playback entry point."""
+"""RSL-RL playback entry point on direct MuJoCo."""
 
 from __future__ import annotations
 
@@ -16,15 +16,25 @@ from threading import Lock
 import numpy as np
 import torch
 
-import go1_tasks
-from go1_tasks import GO1_MODE_TASKS, latest_go1_pretrain_checkpoint
-from mbpo.envs.go1.mujoco_go1_backend import PureMujocoGo1Model, draw_go1_velocity_arrows
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
 from mjlab.utils.gpu import select_gpus
 from mjlab.utils.torch import configure_torch_backends
 from rsl_rl.modules import ActorCritic
 
-_BASE_GO1_TASKS = {"go1", "go1_velocity_flat", "Mjlab-Velocity-Flat-Unitree-Go1"}
+from mbpo.envs.go1.mujoco_go1_backend import PureMujocoGo1Model
+from mbpo.envs.jackal.mujoco_jackal_backend import PureMujocoJackalModel
+from mbpo.envs.mujoco_backend import draw_velocity_arrows
+from mbpo.rsl_rl.go1_tasks import GO1
+from mbpo.rsl_rl.jackal_tasks import JACKAL
+from mbpo.rsl_rl.mbpo_tasks import (
+    MODES,
+    latest_pretrain_checkpoint,
+    migrate_policy_noise_std_state_dict,
+    normalize_mjlab_rsl_rl_cfg,
+    patch_policy_distribution_safety,
+)
+
+ROBOTS = {"go1": (GO1, PureMujocoGo1Model), "jackal": (JACKAL, PureMujocoJackalModel)}
 
 
 class X11ArrowKeyReader:
@@ -147,9 +157,9 @@ class MujocoArrowCommandController:
         self._key_reader.close()
 
 
-class PureMujocoGo1Player:
-    def __init__(self, env_cfg, agent_cfg, checkpoint_file: Path, device: str) -> None:
-        self.model = PureMujocoGo1Model(env_cfg)
+class PureMujocoPlayer:
+    def __init__(self, backend_cls, env_cfg, agent_cfg, checkpoint_file: Path, device: str) -> None:
+        self.model = backend_cls(env_cfg)
         self.policy_device = torch.device(device)
         if self.policy_device.type == "cuda":
             torch.cuda.set_device(self.policy_device)
@@ -160,7 +170,7 @@ class PureMujocoGo1Player:
         loaded = torch.load(checkpoint_file, weights_only=False, map_location="cpu")
         state_dict = loaded.get("model_state_dict", loaded)
         self.actor_obs_dim = int(state_dict["actor.0.weight"].shape[1])
-        train_cfg = go1_tasks.normalize_mjlab_rsl_rl_cfg(asdict(agent_cfg), mbpo=True)
+        train_cfg = normalize_mjlab_rsl_rl_cfg(asdict(agent_cfg), mbpo=True)
         policy_cfg = dict(train_cfg["policy"])
         policy_cfg.pop("class_name", None)
         obs = {
@@ -169,8 +179,8 @@ class PureMujocoGo1Player:
         }
         policy = ActorCritic(obs=obs, obs_groups=train_cfg["obs_groups"], num_actions=self.model.action_dim, **policy_cfg)
         policy = policy.to(self.policy_device)
-        policy.load_state_dict(go1_tasks._migrate_policy_noise_std_state_dict(policy, state_dict), strict=True)
-        go1_tasks._patch_policy_distribution_safety(policy)
+        policy.load_state_dict(migrate_policy_noise_std_state_dict(policy, state_dict), strict=True)
+        patch_policy_distribution_safety(policy)
         return policy.eval()
 
     def _step_once(self, command: np.ndarray, auto_reset: bool) -> None:
@@ -217,7 +227,7 @@ class PureMujocoGo1Player:
                     self.model.set_active_color(bool(np.any(np.abs(command) > 1.0e-6)))
                     if args.follow_camera:
                         self.model.update_camera(handle.cam)
-                    draw_go1_velocity_arrows(handle.user_scn, self.model.model, self.model.data, command)
+                    draw_velocity_arrows(handle.user_scn, self.model.model, self.model.data, command)
                 handle.sync()
                 step += 1
                 time.sleep(max(self.model.step_dt - (time.time() - start_time), 0.0))
@@ -280,23 +290,23 @@ def _resolve_device(device: str | None, gpu_ids: list[int] | str | None) -> str:
     return "cuda:0"
 
 
-def _resolve_task(task: str | None, mode: str | None) -> str:
-    if mode is not None and (task is None or task in _BASE_GO1_TASKS):
-        return GO1_MODE_TASKS[mode]
-    if task in _BASE_GO1_TASKS:
-        return GO1_MODE_TASKS["pretrain"]
-    if task is None:
+def _resolve_task(task: str | None, mode: str | None):
+    if task is None and mode is None:
         raise SystemExit("A task id is required, or use --task go1 --mode pretrain")
-    if task not in GO1_MODE_TASKS.values():
-        raise SystemExit("Pure MuJoCo play currently supports the Go1 tasks only.")
-    return task
+    if task is None or task in ROBOTS:
+        robot, backend_cls = ROBOTS[task or "go1"]
+        return robot, backend_cls, robot.mode_tasks[mode or "pretrain"]
+    for robot, backend_cls in ROBOTS.values():
+        if task in robot.mode_tasks.values():
+            return robot, backend_cls, task
+    raise SystemExit(f"Pure MuJoCo play supports the {', '.join(ROBOTS)} tasks only.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Play a Go1 RSL-RL checkpoint in direct MuJoCo.")
-    parser.add_argument("task_pos", nargs="?", help="Task id, or go1 alias.")
-    parser.add_argument("--task", dest="task_opt", help="Task id, or go1 alias.")
-    parser.add_argument("--mode", choices=sorted(GO1_MODE_TASKS), type=str.lower, help="Go1 mode alias.")
+    parser = argparse.ArgumentParser(description="Play an RSL-RL checkpoint in direct MuJoCo.")
+    parser.add_argument("task_pos", nargs="?", help="Task id, or robot alias.")
+    parser.add_argument("--task", dest="task_opt", help="Task id, or robot alias.")
+    parser.add_argument("--mode", choices=MODES, type=str.lower, help="Mode alias.")
     parser.add_argument("--checkpoint-file", "--checkpoint_file", "--checkpoint")
     parser.add_argument("--device", default=None)
     parser.add_argument("--gpu-ids", "--gpu_ids", type=_parse_gpu_ids, default=None)
@@ -313,16 +323,16 @@ def main() -> None:
 
     device = _resolve_device(args.device, args.gpu_ids)
     configure_torch_backends()
-    task = _resolve_task(args.task_opt or args.task_pos, args.mode)
-    checkpoint_file = latest_go1_pretrain_checkpoint() if args.checkpoint_file is None else Path(args.checkpoint_file).expanduser()
+    robot, backend_cls, task = _resolve_task(args.task_opt or args.task_pos, args.mode)
+    checkpoint_file = latest_pretrain_checkpoint(robot.experiment) if args.checkpoint_file is None else Path(args.checkpoint_file).expanduser()
     if checkpoint_file is None or not checkpoint_file.exists():
-        raise SystemExit(f"Checkpoint not found: {checkpoint_file or 'logs/rsl_rl/go1_velocity/*_pretrain/model_*.pt'}")
+        raise SystemExit(f"Checkpoint not found: {checkpoint_file or f'logs/rsl_rl/{robot.experiment}/*_pretrain/model_*.pt'}")
     print(f"[INFO] Loading checkpoint: {checkpoint_file}")
 
     env_cfg, agent_cfg = load_env_cfg(task, play=True), load_rl_cfg(task)
     if args.no_terminations:
         env_cfg.terminations = {}
-    PureMujocoGo1Player(env_cfg, agent_cfg, checkpoint_file, device=device).run(args)
+    PureMujocoPlayer(backend_cls, env_cfg, agent_cfg, checkpoint_file, device=device).run(args)
 
 
 if __name__ == "__main__":

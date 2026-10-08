@@ -6,7 +6,7 @@ local script name available for existing workflows.
 
 from __future__ import annotations
 
-import go1_tasks  # noqa: F401
+import mbpo.rsl_rl.go1_tasks  # noqa: F401
 from mjlab.scripts.play import main
 
 

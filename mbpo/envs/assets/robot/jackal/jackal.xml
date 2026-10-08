@@ -1,0 +1,70 @@
+<mujoco model="jackal">
+  <compiler angle="radian" meshdir="assets" autolimits="true"/>
+
+  <asset>
+    <mesh name="jackal-fender" file="jackal-fender.stl"/>
+    <mesh name="jackal-wheel" file="jackal-wheel.stl"/>
+  </asset>
+
+  <default>
+    <geom solref="-200 -50" solimp="0.9 0.95 0.02"/>
+    <default class="throttle">
+      <joint type="hinge" axis="0 1 0" frictionloss="0.1" damping="1.0" armature="0.05" limited="false"/>
+    </default>
+    <default class="wheel">
+      <geom type="capsule" size="0.095 0.00001" quat="0.707107 0.707107 0 0" contype="0" conaffinity="1" condim="3" priority="1" friction="1 0.005 0.0001" rgba="0.15 0.15 0.15 0"/>
+    </default>
+    <default class="wheel_visual">
+      <geom type="mesh" mesh="jackal-wheel" quat="0.707107 0.707107 0 0" contype="0" conaffinity="0" density="0" group="2" rgba="0.15 0.15 0.15 1"/>
+    </default>
+    <default class="sensor_visual">
+      <geom type="box" contype="0" conaffinity="0" group="2" rgba="0.1 0.1 0.1 1"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="base_link" pos="0 0 0.1">
+      <camera name="track" pos="1.139 -1.080 1.462" xyaxes="0.652 0.758 0 -0.539 0.464 0.702" mode="trackcom"/>
+      <freejoint name="base_free_joint"/>
+      <body name="base_footprint" pos="0 0 0.092">
+        <inertial pos="0 0 0" mass="16.523" diaginertia="0.3136 0.3922 0.4485"/>
+        <geom name="chassis" type="box" size="0.21 0.155 0.092" condim="1" contype="0" conaffinity="1" rgba="0.2 0.2 0.2 1"/>
+      </body>
+      <geom type="mesh" mesh="jackal-fender" condim="1" contype="0" conaffinity="1" rgba="0.8 0.8 0 1"/>
+      <geom type="mesh" mesh="jackal-fender" quat="0 0 0 1" condim="1" contype="0" conaffinity="1" rgba="0.8 0.8 0 1"/>
+      <geom name="lidar" class="sensor_visual" size="0.05 0.05 0.035" pos="0 0 0.266" mass="0.83"/>
+      <geom name="lidar_tower" class="sensor_visual" size="0.04 0.04 0.04" pos="0 0 0.184" mass="0.63"/>
+      <geom name="cameras" class="sensor_visual" size="0.015 0.045 0.015" pos="0.21 0 0.215" mass="0.127"/>
+      <site name="imu" pos="0 0 0" group="5"/>
+      <body name="front_left_wheel_link" pos="0.131 0.187795 0.0345">
+        <inertial pos="0 0 0" quat="0.707107 0 0 0.707107" mass="0.477" diaginertia="0.0024 0.0013 0.0013"/>
+        <joint name="front_left_wheel" class="throttle"/>
+        <geom class="wheel_visual"/>
+        <geom name="front_left_wheel" class="wheel"/>
+      </body>
+      <body name="front_right_wheel_link" pos="0.131 -0.187795 0.0345">
+        <inertial pos="0 0 0" quat="0.707107 0 0 0.707107" mass="0.477" diaginertia="0.0024 0.0013 0.0013"/>
+        <joint name="front_right_wheel" class="throttle"/>
+        <geom class="wheel_visual"/>
+        <geom name="front_right_wheel" class="wheel"/>
+      </body>
+      <body name="rear_left_wheel_link" pos="-0.131 0.187795 0.0345">
+        <inertial pos="0 0 0" quat="0.707107 0 0 0.707107" mass="0.477" diaginertia="0.0024 0.0013 0.0013"/>
+        <joint name="rear_left_wheel" class="throttle"/>
+        <geom class="wheel_visual"/>
+        <geom name="rear_left_wheel" class="wheel"/>
+      </body>
+      <body name="rear_right_wheel_link" pos="-0.131 -0.187795 0.0345">
+        <inertial pos="0 0 0" quat="0.707107 0 0 0.707107" mass="0.477" diaginertia="0.0024 0.0013 0.0013"/>
+        <joint name="rear_right_wheel" class="throttle"/>
+        <geom class="wheel_visual"/>
+        <geom name="rear_right_wheel" class="wheel"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <gyro name="imu_ang_vel" site="imu"/>
+    <velocimeter name="imu_lin_vel" site="imu"/>
+  </sensor>
+</mujoco>

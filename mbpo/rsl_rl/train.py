@@ -33,7 +33,6 @@ def _restart_without_system_cuda() -> None:
 _restart_without_system_cuda()
 
 INFO_GAIN_MODES = ("qoed", "qoed-agnostic", "boed", "nothing")
-_BASE_GO1_TASKS = {"go1", "go1_velocity_flat", "Mjlab-Velocity-Flat-Unitree-Go1"}
 
 _parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
 _parser.add_argument("--task")
@@ -46,18 +45,23 @@ _parser.add_argument("--checkpoint", "--checkpoint-file", "--checkpoint_file")
 _parser.add_argument("--domain-randomization", "--domain_randomization", action=argparse.BooleanOptionalAction, default=True)
 _parser.add_argument("--headless", action="store_true")
 _args, _mjlab_args = _parser.parse_known_args()
-os.environ["QOED_GO1_DOMAIN_RANDOMIZATION"] = "1" if _args.domain_randomization else "0"
+os.environ["QOED_DOMAIN_RANDOMIZATION"] = "1" if _args.domain_randomization else "0"
 
 import torch
-from go1_tasks import GO1_MODE_TASKS, latest_go1_pretrain_checkpoint, normalize_mjlab_rsl_rl_cfg
 from mjlab.rl.runner import MjlabOnPolicyRunner
+
+from mbpo.rsl_rl.go1_tasks import GO1
+from mbpo.rsl_rl.jackal_tasks import JACKAL
+from mbpo.rsl_rl.mbpo_tasks import MODES, latest_pretrain_checkpoint, normalize_mjlab_rsl_rl_cfg
+
+ROBOTS = {"go1": GO1, "jackal": JACKAL}
 
 
 def _rewrite_args_for_mjlab(args, mjlab_args: list[str]) -> None:
     info_gain = args.info_gain.strip().lower().replace("_", "-")
     if info_gain not in INFO_GAIN_MODES:
         raise SystemExit(f"Unknown --info-gain mode '{args.info_gain}'. Available modes: {', '.join(INFO_GAIN_MODES)}")
-    os.environ["QOED_GO1_INFO_GAIN"] = info_gain
+    os.environ["QOED_INFO_GAIN"] = info_gain
     if args.viewer is not None:
         os.environ["QOED_TRAIN_VIEWER"] = args.viewer
     if args.follow_camera:
@@ -70,12 +74,11 @@ def _rewrite_args_for_mjlab(args, mjlab_args: list[str]) -> None:
     task, mode = args.task, args.mode
     if task is None and mjlab_args and not mjlab_args[0].startswith("-"):
         task = mjlab_args.pop(0)
-    if mode is not None:
-        if mode not in GO1_MODE_TASKS:
-            raise SystemExit(f"Unknown Go1 mode '{mode}'. Available modes: {', '.join(sorted(GO1_MODE_TASKS))}")
-        if task is None or task in _BASE_GO1_TASKS:
-            task = GO1_MODE_TASKS[mode]
-    mode = mode or next((name for name, task_id in GO1_MODE_TASKS.items() if task == task_id), None)
+    if mode is not None and mode not in MODES:
+        raise SystemExit(f"Unknown mode '{mode}'. Available modes: {', '.join(MODES)}")
+    if mode is not None and (task is None or task in ROBOTS):
+        task = ROBOTS[task or "go1"].mode_tasks[mode]
+    robot, mode = next(((r, m) for r in ROBOTS.values() for m, t in r.mode_tasks.items() if t == task), (None, mode))
 
     if mode == "finetune":
         gpu_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -85,13 +88,13 @@ def _rewrite_args_for_mjlab(args, mjlab_args: list[str]) -> None:
         if ids or (gpu.gpu_ids or "").strip().lower() == "all":
             os.environ["QOED_TRAIN_REQUESTED_CUDA_VISIBLE_DEVICES"] = ",".join(ids) or "all"
 
-        os.environ["QOED_GO1_FINETUNE"] = "1"
+        os.environ["QOED_FINETUNE"] = "1"
         checkpoint = os.environ.get("QOED_POLICY_CHECKPOINT")
         dynamics_path = os.environ.get("QOED_SYSTEM_DYNAMICS_LOAD_PATH")
         if checkpoint is None and dynamics_path is None:
-            latest = latest_go1_pretrain_checkpoint()
+            latest = latest_pretrain_checkpoint(robot.experiment)
             if latest is None:
-                raise SystemExit("No Go1 pretrain checkpoint found under logs/rsl_rl/go1_velocity/*_pretrain/")
+                raise SystemExit(f"No pretrain checkpoint found under logs/rsl_rl/{robot.experiment}/*_pretrain/")
             checkpoint = dynamics_path = str(latest)
         os.environ.setdefault("QOED_POLICY_CHECKPOINT", checkpoint or dynamics_path)
         os.environ.setdefault("QOED_SYSTEM_DYNAMICS_LOAD_PATH", dynamics_path or checkpoint)
@@ -162,12 +165,14 @@ from mjlab.tasks.registry import load_runner_cls
 from mjlab.utils.wandb import add_wandb_tags
 
 from mbpo.envs.go1.mujoco_go1_train_env import DirectMujocoGo1VecEnv
+from mbpo.envs.jackal.mujoco_jackal_train_env import DirectMujocoJackalVecEnv
 
+FINETUNE_ENVS = {GO1.mode_tasks["finetune"]: DirectMujocoGo1VecEnv, JACKAL.mode_tasks["finetune"]: DirectMujocoJackalVecEnv}
 _mjlab_run_train = mjlab_train.run_train
 
 
 def _run_train(task_id, cfg, log_dir):
-    if task_id != GO1_MODE_TASKS["finetune"]:
+    if task_id not in FINETUNE_ENVS:
         return _mjlab_run_train(task_id, cfg, log_dir)
 
     if not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.environ.get("QOED_TRAIN_REQUESTED_CUDA_VISIBLE_DEVICES"):
@@ -188,7 +193,7 @@ def _run_train(task_id, cfg, log_dir):
     if cfg.video:
         raise SystemExit("Video recording is not implemented for direct MuJoCo training.")
 
-    env = DirectMujocoGo1VecEnv(
+    env = FINETUNE_ENVS[task_id](
         cfg.env,
         agent_cfg=cfg.agent,
         seed=seed,

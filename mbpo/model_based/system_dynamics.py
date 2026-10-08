@@ -126,6 +126,7 @@ class QOED_MBPOPPO(MBPOPPO):
 
         self._fisher_prev_state = None
         self._fisher_prev_valid = None
+        self._fisher_residual_var = None
         self._fisher_window = 20
         self._fisher_param_min = fisher_param_min
         self._fisher_param_max = fisher_param_max
@@ -271,6 +272,7 @@ class QOED_MBPOPPO(MBPOPPO):
                 estimator.add_sample(self._fisher_prev_state[idx], system_action[idx], system_state[idx])
             if len(estimator.est_history) >= self._fisher_window:
                 estimator.history = estimator.history[-self._fisher_window :]
+                self._calibrate_fisher_noise()
                 estimator.update_posterior()
                 estimator.est_history.clear()
 
@@ -279,6 +281,17 @@ class QOED_MBPOPPO(MBPOPPO):
         privilege = self._estimated_system_privilege(n, system_state)
         self._sync_system_dynamics_privilege_source()
         return privilege
+
+    def _calibrate_fisher_noise(self):
+        estimator = self.parameter_estimator
+        states, actions, observed, _ = estimator.stack(estimator.est_history)
+        with torch.no_grad():
+            predicted = estimator.dyn.step(states, actions, estimator.dist.mean.reshape(1, -1).expand(states.shape[0], -1))
+        variance = (observed - predicted).square().mean(0)
+        previous = self._fisher_residual_var
+        self._fisher_residual_var = variance if previous is None else 0.9 * previous + 0.1 * variance
+        estimator.R_inv = torch.diag(1.0 / self._fisher_residual_var.clamp_min(1.0e-4))
+        estimator._fisher_cache = None
 
     def fill_history_buffer(self, obs):
         system_state = self.state_normalizer(obs["system_state"])

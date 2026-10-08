@@ -58,7 +58,7 @@ qoed-franka-demo --device cuda:0 --sweep
 
 #### 2.1 Pretrain in Simulation (ETA: 1 hour)
 
-Optional: train the dynamics model and policy. A pretrained checkpoint is provided under `logs/`.
+Optional: train the dynamics model and policy. Pretrained checkpoints are provided under `logs/`. `--task` selects the robot: `go1` or `jackal`.
 
 ```bash
 python mbpo/rsl_rl/train.py --task go1 --mode pretrain --gpu-ids "[0, ]" --headless
@@ -72,7 +72,7 @@ python mbpo/rsl_rl/play.py --task go1 --mode pretrain --gpu-ids "[0, ]" --viewer
 
 #### 2.2 Online Learning
 
-Run real-world online RL, using MuJoCo as the real-system proxy. Each run draws the robot's PD gains and payload from the prior, and the info-gain mode decides how the robot explores to identify them.
+Run real-world online RL, using MuJoCo as the real-system proxy. Each run draws the robot's physical parameters from the prior (Go1: PD gains and payload; Jackal: wheel friction, motor gains, damping, and payload), and the info-gain mode decides how the robot explores to identify them.
 
 ```bash
 python mbpo/rsl_rl/train.py --task go1 --mode finetune --info-gain qoed --gpu-ids "[0, ]" --viewer auto
