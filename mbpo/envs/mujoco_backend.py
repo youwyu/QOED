@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import mujoco
 import numpy as np
 from mjlab.scene import Scene
@@ -22,7 +24,7 @@ def draw_velocity_arrows(
     data: mujoco.MjData,
     command: np.ndarray,
 ) -> None:
-    if user_scn is None:
+    if user_scn is None or mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, "robot/imu_lin_vel") < 0:
         return
 
     user_scn.ngeom = 0
@@ -121,6 +123,27 @@ def _add_arrow(
     user_scn.ngeom += 1
 
 
+def _resolve_name_values(
+    values: float | int | dict[str, float],
+    names: list[str],
+    default: float,
+) -> np.ndarray:
+    if isinstance(values, (float, int)):
+        return np.full(len(names), float(values), dtype=np.float32)
+    resolved = np.full(len(names), float(default), dtype=np.float32)
+    matched = np.zeros(len(names), dtype=bool)
+    for pattern, value in values.items():
+        regex = re.compile(pattern)
+        for index, name in enumerate(names):
+            if regex.match(name):
+                resolved[index] = float(value)
+                matched[index] = True
+    if not bool(matched.all()):
+        missing = ", ".join(name for name, ok in zip(names, matched) if not ok)
+        raise RuntimeError(f"Action scale did not match joints: {missing}")
+    return resolved
+
+
 class PureMujocoModel:
     """Single-robot MuJoCo model compiled from an MJLab scene; subclasses map actions and joint observations."""
 
@@ -158,8 +181,10 @@ class PureMujocoModel:
             self.ctrl_action_indices[ctrl_id] = action_name_to_index[joint_name]
         self.action_dim = self._setup_actions(action_cfg)
 
-        self.lin_vel_slice = mujoco_sensor_slice(self.model, "robot/imu_lin_vel")
-        self.ang_vel_slice = mujoco_sensor_slice(self.model, "robot/imu_ang_vel")
+        self.lin_vel_slice, self.ang_vel_slice = (
+            mujoco_sensor_slice(self.model, name) if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, name) >= 0 else None
+            for name in ("robot/imu_lin_vel", "robot/imu_ang_vel")
+        )
         self.last_action = np.zeros(self.action_dim, dtype=np.float32)
 
         self.robot_geom_ids = mujoco_geom_ids_with_prefix(self.model, "robot/")
@@ -188,6 +213,10 @@ class PureMujocoModel:
         rotation_body_to_world = quat_wxyz_to_matrix(self.data.qpos[3:7])
         gravity_world = np.asarray([0.0, 0.0, -1.0], dtype=np.float64)
         return (rotation_body_to_world.T @ gravity_world).astype(np.float32)
+
+    def root_velocity(self) -> np.ndarray:
+        rotation_body_to_world = quat_wxyz_to_matrix(self.data.qpos[3:7])
+        return np.concatenate((rotation_body_to_world.T @ self.data.qvel[0:3], self.data.qvel[3:6])).astype(np.float32)
 
     def joint_pos_rel(self) -> np.ndarray:
         return self.data.qpos[self.obs_qpos_adrs].astype(np.float32) - self.default_joint_pos
@@ -234,3 +263,23 @@ class PureMujocoModel:
 
     def update_camera(self, camera) -> None:
         set_follow_camera(camera, self.data.qpos, self.camera_distance)
+
+
+class JointPositionMujocoModel(PureMujocoModel):
+    """Single-robot MuJoCo model with MJLab-compatible joint position actions."""
+
+    action_name = "joint_pos"
+
+    def _setup_actions(self, action_cfg) -> int:
+        action_to_obs_indices = np.asarray([self.obs_joint_names.index(name) for name in self.action_joint_names], dtype=np.int32)
+        self.default_action_joint_pos = self.default_joint_pos[action_to_obs_indices]
+        self.action_scale = _resolve_name_values(action_cfg.scale, self.action_joint_names, 1.0)
+        self.default_ctrl = self.default_action_joint_pos[self.ctrl_action_indices].astype(np.float64)
+        return len(self.action_joint_names)
+
+    def ctrl(self, action: np.ndarray) -> np.ndarray:
+        target_action_joint_pos = self.default_action_joint_pos + action * self.action_scale
+        return target_action_joint_pos[self.ctrl_action_indices].astype(np.float64)
+
+    def joint_observation(self) -> list[np.ndarray]:
+        return [self.joint_pos_rel(), self.joint_vel_rel()]

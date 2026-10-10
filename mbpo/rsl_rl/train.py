@@ -50,11 +50,13 @@ os.environ["QOED_DOMAIN_RANDOMIZATION"] = "1" if _args.domain_randomization else
 import torch
 from mjlab.rl.runner import MjlabOnPolicyRunner
 
+from mbpo.rsl_rl.g1_tasks import G1
 from mbpo.rsl_rl.go1_tasks import GO1
 from mbpo.rsl_rl.jackal_tasks import JACKAL
+from mbpo.rsl_rl.leap_tasks import LEAP
 from mbpo.rsl_rl.mbpo_tasks import MODES, latest_pretrain_checkpoint, normalize_mjlab_rsl_rl_cfg
 
-ROBOTS = {"go1": GO1, "jackal": JACKAL}
+ROBOTS = {"go1": GO1, "jackal": JACKAL, "g1": G1, "leap": LEAP}
 
 
 def _rewrite_args_for_mjlab(args, mjlab_args: list[str]) -> None:
@@ -164,10 +166,17 @@ import mjlab.scripts.train as mjlab_train
 from mjlab.tasks.registry import load_runner_cls
 from mjlab.utils.wandb import add_wandb_tags
 
+from mbpo.envs.g1.mujoco_g1_train_env import DirectMujocoG1VecEnv
 from mbpo.envs.go1.mujoco_go1_train_env import DirectMujocoGo1VecEnv
 from mbpo.envs.jackal.mujoco_jackal_train_env import DirectMujocoJackalVecEnv
+from mbpo.envs.leap_hand.mujoco_leap_train_env import DirectMujocoLeapVecEnv
 
-FINETUNE_ENVS = {GO1.mode_tasks["finetune"]: DirectMujocoGo1VecEnv, JACKAL.mode_tasks["finetune"]: DirectMujocoJackalVecEnv}
+FINETUNE_ENVS = {
+    GO1.mode_tasks["finetune"]: DirectMujocoGo1VecEnv,
+    JACKAL.mode_tasks["finetune"]: DirectMujocoJackalVecEnv,
+    G1.mode_tasks["finetune"]: DirectMujocoG1VecEnv,
+    LEAP.mode_tasks["finetune"]: DirectMujocoLeapVecEnv,
+}
 _mjlab_run_train = mjlab_train.run_train
 
 

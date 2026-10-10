@@ -19,6 +19,7 @@ class MujocoModelDefaults:
     dof_damping: np.ndarray
     body_ipos: np.ndarray
     body_mass: np.ndarray
+    body_inertia: np.ndarray
     qpos0: np.ndarray
     actuator_gainprm: np.ndarray
     actuator_biasprm: np.ndarray
@@ -77,6 +78,7 @@ def save_mujoco_model_defaults(model: mujoco.MjModel) -> MujocoModelDefaults:
         dof_damping=model.dof_damping.copy(),
         body_ipos=model.body_ipos.copy(),
         body_mass=model.body_mass.copy(),
+        body_inertia=model.body_inertia.copy(),
         qpos0=model.qpos0.copy(),
         actuator_gainprm=model.actuator_gainprm.copy(),
         actuator_biasprm=model.actuator_biasprm.copy(),
@@ -90,6 +92,7 @@ def restore_mujoco_model_defaults(model: mujoco.MjModel, defaults: MujocoModelDe
     model.dof_damping[:] = defaults.dof_damping
     model.body_ipos[:] = defaults.body_ipos
     model.body_mass[:] = defaults.body_mass
+    model.body_inertia[:] = defaults.body_inertia
     model.qpos0[:] = defaults.qpos0
     model.actuator_gainprm[:] = defaults.actuator_gainprm
     model.actuator_biasprm[:] = defaults.actuator_biasprm

@@ -21,11 +21,14 @@ from mjlab.utils.gpu import select_gpus
 from mjlab.utils.torch import configure_torch_backends
 from rsl_rl.modules import ActorCritic
 
-from mbpo.envs.go1.mujoco_go1_backend import PureMujocoGo1Model
+from mbpo.envs.g1.mujoco_g1_train_env import PureMujocoG1Model
 from mbpo.envs.jackal.mujoco_jackal_backend import PureMujocoJackalModel
-from mbpo.envs.mujoco_backend import draw_velocity_arrows
+from mbpo.envs.leap_hand.mujoco_leap_train_env import PureMujocoLeapModel
+from mbpo.envs.mujoco_backend import JointPositionMujocoModel, draw_velocity_arrows
+from mbpo.rsl_rl.g1_tasks import G1
 from mbpo.rsl_rl.go1_tasks import GO1
 from mbpo.rsl_rl.jackal_tasks import JACKAL
+from mbpo.rsl_rl.leap_tasks import LEAP
 from mbpo.rsl_rl.mbpo_tasks import (
     MODES,
     latest_pretrain_checkpoint,
@@ -34,7 +37,12 @@ from mbpo.rsl_rl.mbpo_tasks import (
     patch_policy_distribution_safety,
 )
 
-ROBOTS = {"go1": (GO1, PureMujocoGo1Model), "jackal": (JACKAL, PureMujocoJackalModel)}
+ROBOTS = {
+    "go1": (GO1, JointPositionMujocoModel),
+    "jackal": (JACKAL, PureMujocoJackalModel),
+    "g1": (G1, PureMujocoG1Model),
+    "leap": (LEAP, PureMujocoLeapModel),
+}
 
 
 class X11ArrowKeyReader:

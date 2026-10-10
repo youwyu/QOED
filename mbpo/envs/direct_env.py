@@ -506,6 +506,9 @@ class DirectMujocoVecEnv(VecEnv):
             self._sample_command()
 
     def _sample_command(self, force: bool = False) -> None:
+        command_cfg = getattr(self.cfg, "commands", {}).get("twist")
+        if command_cfg is None:
+            return
         if (not force) and self.rng.random() < self._standing_probability:
             self.command[:] = 0.0
         else:
@@ -514,8 +517,7 @@ class DirectMujocoVecEnv(VecEnv):
                 self.rng.uniform(*self._command_ranges.lin_vel_y),
                 self.rng.uniform(*self._command_ranges.ang_vel_z),
             )
-        command_cfg = getattr(self.cfg, "commands", {}).get("twist")
-        seconds_range = getattr(command_cfg, "resampling_time_range", (3.0, 8.0))
+        seconds_range = command_cfg.resampling_time_range
         seconds = float(self.rng.uniform(seconds_range[0], seconds_range[1]))
         self._command_resample_interval = max(1, int(round(seconds / self.step_dt)))
 

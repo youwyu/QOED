@@ -20,6 +20,7 @@ wandb/
 logs/**
 !logs/**/
 !logs/rsl_rl/*/2000-01-01_00-00-00_pretrain/model_1000.pt
+!logs/rsl_rl/g1_velocity/2000-01-01_00-00-00_pretrain/model_4000.pt
 !logs/rsl_rl/*/2000-01-01_00-00-00_pretrain/params/*
 outputs/
 
@@ -34,3 +35,5 @@ __pycache__
 .vscode/
 *.swp
 *.swo
+.claude
+.ruff_cache

@@ -58,10 +58,12 @@ class MbpoRobot:
     prior_mean: tuple[float, ...]
     prior_var: tuple[float, ...]
     finetune_steps: int = 100
+    pretrain_iterations: int = 1000
+    task: str = "Velocity-Flat"
 
     @property
     def mode_tasks(self) -> dict[str, str]:
-        return {mode: f"QOED-Mjlab-Velocity-Flat-{self.name}-{mode.capitalize()}-v0" for mode in MODES}
+        return {mode: f"QOED-Mjlab-{self.task}-{self.name}-{mode.capitalize()}-v0" for mode in MODES}
 
 
 def uniform_mean_var(low: float, high: float) -> tuple[float, float]:
@@ -98,15 +100,17 @@ def observation_group(**terms) -> ObservationGroupCfg:
     return ObservationGroupCfg(terms=terms, enable_corruption=False, concatenate_terms=True)
 
 
-def add_mbpo_observations(cfg, state_terms: dict[str, Callable]) -> None:
+def add_mbpo_observations(cfg, state_terms: dict[str, Callable], termination: ObservationTermCfg | None = None) -> None:
     cfg.observations.setdefault("policy", deepcopy(cfg.observations["actor"]))
     cfg.observations["system_state"] = observation_group(**{name: ObservationTermCfg(func=func) for name, func in state_terms.items()})
     cfg.observations["system_action"] = observation_group(actions=ObservationTermCfg(func=obs_mdp.last_action))
     if "foot_contact" in cfg.observations["critic"].terms:
         cfg.observations["system_contact"] = observation_group(foot_contact=deepcopy(cfg.observations["critic"].terms["foot_contact"]))
-    fell_over_cfg = cfg.terminations.get("fell_over")
-    fell_over_params = deepcopy(fell_over_cfg.params) if fell_over_cfg is not None else {"limit_angle": 1.2217304763960306}
-    cfg.observations["system_termination"] = observation_group(fell_over=ObservationTermCfg(func=bad_orientation, params=fell_over_params))
+    if termination is None:
+        fell_over_cfg = cfg.terminations.get("fell_over")
+        fell_over_params = deepcopy(fell_over_cfg.params) if fell_over_cfg is not None else {"limit_angle": 1.2217304763960306}
+        termination = ObservationTermCfg(func=bad_orientation, params=fell_over_params)
+    cfg.observations["system_termination"] = observation_group(fell_over=termination)
 
 
 def add_privilege_observation(cfg, privilege: Callable) -> None:
@@ -428,7 +432,7 @@ def configure_agent_cfg(cfg, mode: str, robot: MbpoRobot):
     cfg.actor.distribution_cfg["std_type"] = POLICY_NOISE_STD_TYPE
     cfg.actor.obs_normalization = cfg.critic.obs_normalization = False
     if mode == "pretrain":
-        cfg.max_iterations = 1000
+        cfg.max_iterations = robot.pretrain_iterations
     elif mode == "finetune":
         cfg.max_iterations = 20
         cfg.num_steps_per_env = robot.finetune_steps

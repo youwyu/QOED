@@ -31,8 +31,9 @@ uv pip install -e ".[mjlab]" --no-cache
 
 - [x] RSS experiments: Jackal, Franka, Go1-Quadruped
 - [x] Code optimization, e.g., torch.compile() or JAX
+- [x] Additional robot platforms, e.g., G1-Humanoid, Leap-Hand
 - [ ] Additional demos, e.g., next-best-view or differentiable MPC
-- [ ] Additional robot platforms, e.g., G1-Humanoid, Inspire-Hand
+- [ ] All robots from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie)
 
 ## Experiment 1. Quick Demos of Jackal and Franka
 
@@ -58,7 +59,7 @@ qoed-franka-demo --device cuda:0 --sweep
 
 #### 2.1 Pretrain in Simulation (ETA: 1 hour)
 
-Optional: train the dynamics model and policy. Pretrained checkpoints are provided under `logs/`. `--task` selects the robot: `go1` or `jackal`.
+Optional: train the dynamics model and policy. Pretrained checkpoints are provided under `logs/`. `--task` selects the robot: `go1`, `jackal`, `g1`, or `leap`.
 
 ```bash
 python mbpo/rsl_rl/train.py --task go1 --mode pretrain --gpu-ids "[0, ]" --headless
@@ -72,13 +73,34 @@ python mbpo/rsl_rl/play.py --task go1 --mode pretrain --gpu-ids "[0, ]" --viewer
 
 #### 2.2 Online Learning
 
-Run real-world online RL, using MuJoCo as the real-system proxy. Each run draws the robot's physical parameters from the prior (Go1: PD gains and payload; Jackal: wheel friction, motor gains, damping, and payload), and the info-gain mode decides how the robot explores to identify them.
+Run real-world online RL, using MuJoCo as the real-system proxy.
 
 ```bash
 python mbpo/rsl_rl/train.py --task go1 --mode finetune --info-gain qoed --gpu-ids "[0, ]" --viewer auto
 ```
 
 Available info-gain modes: `qoed`, `qoed-agnostic`, `boed`, and `nothing`.
+
+<details name="robot" open>
+<summary>Unitree Go1</summary>
+
+![Go1 online learning with QOED, BOED, QOED-Agnostic, and no info gain](mbpo/envs/assets/snapshot/qoed_go1.gif)
+
+</details>
+
+<details name="robot">
+<summary>Clearpath Jackal</summary>
+
+![Jackal online learning with QOED, BOED, QOED-Agnostic, and no info gain](mbpo/envs/assets/snapshot/qoed_jackal.gif)
+
+</details>
+
+<details name="robot">
+<summary>LEAP Hand</summary>
+
+![LEAP Hand online learning with QOED, BOED, QOED-Agnostic, and no info gain](mbpo/envs/assets/snapshot/qoed_leap.gif)
+
+</details>
 
 ## Miscell
 Please consider cite our work if it is interesting.
