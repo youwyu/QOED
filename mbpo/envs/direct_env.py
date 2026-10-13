@@ -172,9 +172,19 @@ class DirectMujocoVecEnv(VecEnv):
         raise NotImplementedError
 
     def _compute_imagination_reward(
-        self, state: torch.Tensor, action: torch.Tensor
+        self, state: torch.Tensor, action: torch.Tensor, context: dict[str, torch.Tensor] | None = None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         raise NotImplementedError
+
+    def _imagination_reward_context(self) -> dict[str, torch.Tensor]:
+        return {"command": self._imagination_command, "previous_action": self._imagination_last_action}
+
+    def _real_reward_context(self) -> dict[str, np.ndarray]:
+        return {"command": self.command, "previous_action": self.backend.last_action}
+
+    def exploration_reward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        context = {name: torch.as_tensor(value, device=state.device, dtype=state.dtype).expand(state.shape[0], -1) for name, value in self._real_reward_context().items()}
+        return torch.stack(tuple(self._compute_imagination_reward(state, action, context)[1].values()), dim=-1)
 
     def _after_reset(self) -> None:
         pass

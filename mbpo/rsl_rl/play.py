@@ -25,9 +25,9 @@ from mbpo.envs.g1.mujoco_g1_train_env import PureMujocoG1Model
 from mbpo.envs.jackal.mujoco_jackal_backend import PureMujocoJackalModel
 from mbpo.envs.leap_hand.mujoco_leap_train_env import PureMujocoLeapModel
 from mbpo.envs.mujoco_backend import JointPositionMujocoModel, draw_velocity_arrows
-from mbpo.rsl_rl.g1_tasks import G1
-from mbpo.rsl_rl.go1_tasks import GO1
-from mbpo.rsl_rl.jackal_tasks import JACKAL
+from mbpo.rsl_rl.g1_tasks import G1, G1_ROUGH
+from mbpo.rsl_rl.go1_tasks import GO1, GO1_ROUGH
+from mbpo.rsl_rl.jackal_tasks import JACKAL, JACKAL_ROUGH
 from mbpo.rsl_rl.leap_tasks import LEAP
 from mbpo.rsl_rl.mbpo_tasks import (
     MODES,
@@ -42,6 +42,9 @@ ROBOTS = {
     "jackal": (JACKAL, PureMujocoJackalModel),
     "g1": (G1, PureMujocoG1Model),
     "leap": (LEAP, PureMujocoLeapModel),
+    "go1-rough": (GO1_ROUGH, JointPositionMujocoModel),
+    "jackal-rough": (JACKAL_ROUGH, PureMujocoJackalModel),
+    "g1-rough": (G1_ROUGH, PureMujocoG1Model),
 }
 
 

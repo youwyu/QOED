@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 from mjlab.envs.mdp import observations as obs_mdp
 from mjlab.managers import EventTermCfg
@@ -19,14 +21,17 @@ from mbpo.envs.g1.utils import (
     g1_ids,
 )
 from mbpo.rsl_rl.mbpo_tasks import (
+    HEIGHT_SCAN,
     MbpoRobot,
     MbpoRunner,
     add_mbpo_observations,
     add_privilege_observation,
+    add_rough_terrain,
     configure_agent_cfg,
     domain_randomization_enabled,
     register_tasks,
     resolve_env_ids,
+    rough_robot,
     uniform_like,
     uniform_mean_var,
 )
@@ -103,8 +108,9 @@ def _g1_pretrain_domain_randomize(env, env_ids: torch.Tensor | slice | None) -> 
     ids["payload"][env_ids.long()] = payload
 
 
-def _g1_env_cfg(mode: str, play: bool = False):
+def _g1_env_cfg(mode: str, play: bool = False, rough: bool = False):
     cfg = unitree_g1_flat_env_cfg(play=play or mode == "visualize")
+    state_terms = {**_STATE_TERMS, HEIGHT_SCAN: add_rough_terrain(cfg, "pelvis")} if rough else _STATE_TERMS
     for name in ("foot_friction", "encoder_bias", "base_com"):
         cfg.events.pop(name, None)
 
@@ -122,7 +128,7 @@ def _g1_env_cfg(mode: str, play: bool = False):
         cfg.commands["twist"].resampling_time_range = (2.0, 2.0)
 
     if mode in {"pretrain", "finetune", "visualize"}:
-        add_mbpo_observations(cfg, _STATE_TERMS)
+        add_mbpo_observations(cfg, state_terms)
 
     if play:
         cfg.scene.num_envs = 1
@@ -164,14 +170,20 @@ def _g1_robot() -> MbpoRobot:
 
 
 G1 = _g1_robot()
+G1_ROUGH = rough_robot(G1, scan_height=0.76)
 
 
 class G1MBPOOnPolicyRunner(MbpoRunner):
     robot = G1
 
 
-def _g1_agent_cfg(mode: str):
-    return configure_agent_cfg(unitree_g1_ppo_runner_cfg(), mode, G1)
+class G1RoughMBPOOnPolicyRunner(MbpoRunner):
+    robot = G1_ROUGH
+
+
+def _g1_agent_cfg(mode: str, robot: MbpoRobot = G1):
+    return configure_agent_cfg(unitree_g1_ppo_runner_cfg(), mode, robot)
 
 
 register_tasks(G1, _g1_env_cfg, _g1_agent_cfg, G1MBPOOnPolicyRunner)
+register_tasks(G1_ROUGH, partial(_g1_env_cfg, rough=True), partial(_g1_agent_cfg, robot=G1_ROUGH), G1RoughMBPOOnPolicyRunner)

@@ -7,7 +7,7 @@ from rsl_rl.modules import SystemDynamicsEnsemble
 from rsl_rl.storage.replay_buffer import ReplayBuffer as _RslReplayBuffer
 
 from boed.fisher import FisherEstimator, ParameterDistribution
-from boed.objectives import VALID_MODES
+from boed.objectives import VALID_MODES, score_from_mask
 from mbpo.neural import FlowDynamics
 
 INFO_GAIN_NOTHING = "nothing"
@@ -110,17 +110,16 @@ class QOED_MBPOPPO(MBPOPPO):
         fisher_fd_delta_floor: float = 1.0,
         fisher_obs_noise_std: float = 0.025,
         info_gain_mode: str = INFO_GAIN_NOTHING,
-        info_gain_num_actions: int = 1024,
         info_gain_clip_actions: float | None = None,
         **kwargs,
     ):
         if info_gain_mode not in (*VALID_MODES, INFO_GAIN_NOTHING):
             raise ValueError(f"Invalid info_gain_mode '{info_gain_mode}', expected one of {(*VALID_MODES, INFO_GAIN_NOTHING)}")
         self.info_gain_mode = info_gain_mode
-        self.info_gain_num_actions = max(1, int(info_gain_num_actions))
         self.info_gain_clip_actions = None if info_gain_clip_actions is None else float(info_gain_clip_actions)
         self.cumulative_info_gain = 0.0
         self.num_info_gain_selections = 0
+        self.exploration_reward = None
         self.latest_system_dynamics_autoregressive_error = None
         super().__init__(*args, **kwargs)
 
@@ -188,11 +187,7 @@ class QOED_MBPOPPO(MBPOPPO):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         base_action = self.policy.act(obs).detach()
-        candidates = self.policy.distribution.sample((self.info_gain_num_actions,)).detach()
-        candidates = torch.nan_to_num(candidates, nan=0.0, posinf=0.0, neginf=0.0)
-        candidates[0] = base_action
-
-        self.transition.actions = self._select_info_gain_action(obs, candidates, base_action).detach()
+        self.transition.actions = self._select_info_gain_action(obs, base_action).detach()
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
@@ -200,29 +195,45 @@ class QOED_MBPOPPO(MBPOPPO):
         self.transition.observations = obs
         return self.transition.actions
 
-    def _select_info_gain_action(self, obs, candidates: torch.Tensor, fallback_action: torch.Tensor) -> torch.Tensor:
+    def _info_gain_scores(self, state: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.info_gain_clip_actions is not None:
+            actions = actions.clamp(-self.info_gain_clip_actions, self.info_gain_clip_actions)
+        estimator = self.parameter_estimator
+        theta = estimator.dist.mean.reshape(-1)
+        p = theta.numel()
+        eps = estimator.fd_eps * (theta.abs() + estimator.fd_delta_floor)
+        offsets = torch.eye(p, device=theta.device, dtype=theta.dtype) * eps[:, None]
+        thetas = torch.cat((theta + offsets, theta - offsets)).repeat(actions.shape[0], 1)
+        repeated = actions.repeat_interleave(2 * p, dim=0)
+        was_training = self.system_dynamics.training
+        self.system_dynamics.eval()
+        with torch.no_grad():
+            next_state = self.state_normalizer.inverse(estimator.dyn.step(state.expand(thetas.shape[0], -1), self.action_normalizer(repeated), thetas))
+            rewards = self.exploration_reward(next_state, repeated).reshape(actions.shape[0], 2, p, -1)
+        self.system_dynamics.train(was_training)
+        jacobian = (rewards[:, 0] - rewards[:, 1]).transpose(1, 2) / (2.0 * eps)
+        fisher = jacobian.transpose(1, 2) @ jacobian
+        fisher = fisher / fisher.diagonal(dim1=-2, dim2=-1).mean().clamp_min(1.0e-12)
+        scores = score_from_mask(fisher, fisher.diagonal(dim1=-2, dim2=-1).sum(-1), self.info_gain_mode, estimator.mask(self.info_gain_mode))
+        return actions, torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _select_info_gain_action(self, obs, fallback_action: torch.Tensor) -> torch.Tensor:
         system_state = self.state_normalizer(obs["system_state"].to(self.device))
+        mean, std = self.policy.action_mean.detach().to(self.device), self.policy.action_std.detach().to(self.device)
+        dim = mean.shape[-1]
+        probes = torch.cat((torch.eye(dim, device=self.device), -torch.eye(dim, device=self.device)))
         selected = []
-        for env_idx in range(candidates.shape[1]):
-            action_batch = candidates[:, env_idx].to(self.device)
-            if self.info_gain_clip_actions is not None:
-                action_batch = action_batch.clamp(-self.info_gain_clip_actions, self.info_gain_clip_actions)
-            was_training = self.system_dynamics.training
-            self.system_dynamics.eval()
-            scores = self.parameter_estimator.local_fisher_trace_path(
-                system_state[env_idx : env_idx + 1],
-                self.action_normalizer(action_batch).unsqueeze(1),
-                baseline=self.info_gain_mode,
-            )
-            self.system_dynamics.train(was_training)
-            scores = torch.nan_to_num(scores, nan=-torch.inf, posinf=1.0e30, neginf=-torch.inf)
-            if not torch.isfinite(scores).any():
+        for env_idx in range(mean.shape[0]):
+            state = system_state[env_idx : env_idx + 1]
+            _, scores = self._info_gain_scores(state, mean[env_idx] + probes * std[env_idx])
+            gradient = scores[:dim] - scores[dim:]
+            if not gradient.any():
                 selected.append(fallback_action[env_idx].to(self.device))
                 continue
-            best_idx = torch.argmax(scores)
-            self.cumulative_info_gain = self.cumulative_info_gain + scores[best_idx].detach()
+            action, score = self._info_gain_scores(state, (mean[env_idx] + std[env_idx] * torch.sign(gradient))[None])
+            self.cumulative_info_gain = self.cumulative_info_gain + score[0]
             self.num_info_gain_selections += 1
-            selected.append(action_batch[best_idx])
+            selected.append(action[0])
         return torch.stack(selected, dim=0).to(device=fallback_action.device, dtype=fallback_action.dtype)
 
     def _is_imagination_observation(self, obs) -> bool:

@@ -60,7 +60,7 @@ class DirectMujocoJackalVecEnv(DirectMujocoVecEnv):
 
     def _obs_dict(self, system_termination: bool) -> dict[str, torch.Tensor]:
         actor = self.backend.observation(self.command)
-        system_state = actor[:13].astype(np.float32)
+        system_state = np.concatenate((actor[:13], actor[actor.shape[0] - self.backend.num_scan :])).astype(np.float32)
         return {
             "actor": torch.from_numpy(actor).view(1, -1),
             "policy": torch.from_numpy(actor.copy()).view(1, -1),
@@ -92,14 +92,15 @@ class DirectMujocoJackalVecEnv(DirectMujocoVecEnv):
         reward, terms, metrics = self._reward_terms(self.command, lin_vel, ang_vel, action, previous_action, np)
         return float(reward), {k: float(v) for k, v in terms.items()}, {k: float(v) for k, v in metrics.items()}
 
-    def _compute_imagination_reward(self, state: torch.Tensor, action: torch.Tensor):
-        command = self._imagination_command.to(device=state.device, dtype=state.dtype)
-        previous_action = self._imagination_last_action.to(device=state.device, dtype=state.dtype)
+    def _compute_imagination_reward(self, state: torch.Tensor, action: torch.Tensor, context: dict[str, torch.Tensor] | None = None):
+        context = context or self._imagination_reward_context()
+        command = context["command"].to(device=state.device, dtype=state.dtype)
+        previous_action = context["previous_action"].to(device=state.device, dtype=state.dtype)
         return self._reward_terms(command, state[:, 0:3], state[:, 3:6], action, previous_action, torch)
 
     def _imagination_obs_from_state(self, state: torch.Tensor, action: torch.Tensor, termination: torch.Tensor | None = None) -> TensorDict:
         num_envs = state.shape[0]
-        actor = torch.cat((state[:, 0:13], action, self._imagination_command.to(device=state.device, dtype=state.dtype)), dim=-1)
+        actor = torch.cat((state[:, 0:13], action, self._imagination_command.to(device=state.device, dtype=state.dtype), state[:, 13:]), dim=-1)
         if termination is None:
             termination_value = torch.zeros(num_envs, 1, device=state.device, dtype=state.dtype)
         else:

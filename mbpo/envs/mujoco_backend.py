@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 
 import mujoco
@@ -16,6 +17,11 @@ from .utils import (
     quat_wxyz_to_matrix,
     set_follow_camera,
 )
+
+
+RAY_DOWN = np.array([0.0, 0.0, -1.0])
+RAY_TOP = 10.0
+TERRAIN_GEOM_GROUP = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)
 
 
 def draw_velocity_arrows(
@@ -189,6 +195,13 @@ class PureMujocoModel:
 
         self.robot_geom_ids = mujoco_geom_ids_with_prefix(self.model, "robot/")
         self.default_robot_rgba = self.model.geom_rgba[self.robot_geom_ids].copy()
+        scanner = next((sensor for sensor in env_cfg.scene.sensors or () if sensor.name == "terrain_scan"), None)
+        self.rough = scanner is not None
+        self.scan_body_id = mujoco_named_id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"robot/{scanner.frame.name}") if self.rough else -1
+        self.scan_offsets = scanner.pattern.generate_rays(None, "cpu")[0].numpy().astype(np.float64) if self.rough else np.zeros((0, 3))
+        self.scan_max_distance = float(scanner.max_distance) if self.rough else 0.0
+        self.num_scan = len(self.scan_offsets)
+        self._ray_geom = np.zeros(1, dtype=np.int32)
         self.reset()
 
     def _setup_actions(self, action_cfg) -> int:
@@ -209,6 +222,30 @@ class PureMujocoModel:
         self.last_action[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
 
+    def _ray_down(self, origin: np.ndarray, body_exclude: int) -> float:
+        return mujoco.mj_ray(self.model, self.data, origin, RAY_DOWN, TERRAIN_GEOM_GROUP, 1, body_exclude, self._ray_geom)
+
+    def terrain_height(self, points: np.ndarray) -> np.ndarray:
+        heights = np.zeros(len(points), dtype=np.float32)
+        if self.rough:
+            for index, (x, y) in enumerate(points[:, :2]):
+                distance = self._ray_down(np.array([x, y, RAY_TOP]), -1)
+                heights[index] = RAY_TOP - distance if distance >= 0.0 else 0.0
+        return heights
+
+    def height_scan(self) -> np.ndarray:
+        scan = np.full(self.num_scan, self.scan_max_distance, dtype=np.float32)
+        if self.rough:
+            position = self.data.xpos[self.scan_body_id]
+            rotation = self.data.xmat[self.scan_body_id].reshape(3, 3)
+            yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+            cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+            for index, (x, y, _) in enumerate(self.scan_offsets):
+                distance = self._ray_down(position + np.array([cos_yaw * x - sin_yaw * y, sin_yaw * x + cos_yaw * y, 0.0]), self.scan_body_id)
+                if 0.0 <= distance <= self.scan_max_distance:
+                    scan[index] = distance
+        return scan
+
     def projected_gravity(self) -> np.ndarray:
         rotation_body_to_world = quat_wxyz_to_matrix(self.data.qpos[3:7])
         gravity_world = np.asarray([0.0, 0.0, -1.0], dtype=np.float64)
@@ -228,7 +265,7 @@ class PureMujocoModel:
         base_lin_vel = np.asarray(self.data.sensordata[self.lin_vel_slice], dtype=np.float32)
         base_ang_vel = np.asarray(self.data.sensordata[self.ang_vel_slice], dtype=np.float32)
         obs = np.concatenate(
-            [base_lin_vel, base_ang_vel, self.projected_gravity(), *self.joint_observation(), self.last_action, command.astype(np.float32)],
+            [base_lin_vel, base_ang_vel, self.projected_gravity(), *self.joint_observation(), self.last_action, command.astype(np.float32), self.height_scan()],
             axis=0,
         )
         return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)

@@ -5,22 +5,26 @@ from __future__ import annotations
 import os
 import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
+import mujoco
+import numpy as np
 import torch
 from mjlab.envs.mdp import observations as obs_mdp
 from mjlab.envs.mdp import terminations as term_mdp
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg, SceneEntityCfg, TerminationTermCfg
+from mjlab.sensor import GridPatternCfg, ObjRef, RayCastSensorCfg
 from mjlab.tasks.registry import list_tasks, register_mjlab_task
 from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
+from mjlab.utils.noise import UniformNoiseCfg as Unoise
+from PIL import Image
 from rsl_rl.runners import MBPOOnPolicyRunner
 
 MODES = ("init", "pretrain", "finetune", "visualize")
 SYSTEM_PRIVILEGE_OBS_KEY = "system_privilege"
 POLICY_NOISE_STD_TYPE = "log"
-INFO_GAIN_NUM_ACTIONS = 1024
 SYSTEM_DYNAMICS = {
     "ensemble_size": 1,
     "history_horizon": 32,
@@ -42,6 +46,10 @@ SYSTEM_DYNAMICS = {
     },
     "freeze_auxiliary": False,
 }
+TERRAIN_DIR = Path(__file__).resolve().parents[1] / "envs" / "assets" / "terrain"
+HEIGHT_SCAN = "height_scan"
+HEIGHT_SCAN_PATTERN = GridPatternCfg(size=(1.2, 0.8), resolution=0.2)
+NUM_HEIGHT_SCAN = 35
 
 
 @dataclass(frozen=True)
@@ -100,9 +108,11 @@ def observation_group(**terms) -> ObservationGroupCfg:
     return ObservationGroupCfg(terms=terms, enable_corruption=False, concatenate_terms=True)
 
 
-def add_mbpo_observations(cfg, state_terms: dict[str, Callable], termination: ObservationTermCfg | None = None) -> None:
+def add_mbpo_observations(cfg, state_terms: dict[str, Callable | ObservationTermCfg], termination: ObservationTermCfg | None = None) -> None:
     cfg.observations.setdefault("policy", deepcopy(cfg.observations["actor"]))
-    cfg.observations["system_state"] = observation_group(**{name: ObservationTermCfg(func=func) for name, func in state_terms.items()})
+    cfg.observations["system_state"] = observation_group(
+        **{name: term if isinstance(term, ObservationTermCfg) else ObservationTermCfg(func=term) for name, term in state_terms.items()}
+    )
     cfg.observations["system_action"] = observation_group(actions=ObservationTermCfg(func=obs_mdp.last_action))
     if "foot_contact" in cfg.observations["critic"].terms:
         cfg.observations["system_contact"] = observation_group(foot_contact=deepcopy(cfg.observations["critic"].terms["foot_contact"]))
@@ -115,6 +125,53 @@ def add_mbpo_observations(cfg, state_terms: dict[str, Callable], termination: Ob
 
 def add_privilege_observation(cfg, privilege: Callable) -> None:
     cfg.observations[SYSTEM_PRIVILEGE_OBS_KEY] = observation_group(domain_randomization=ObservationTermCfg(func=privilege))
+
+
+def rough_terrain_spec(spec: mujoco.MjSpec) -> None:
+    heights = np.asarray(Image.open(TERRAIN_DIR / "hfield.png").convert("L"), dtype=np.float32) / 255.0
+    heights = np.block([[heights, heights[:, ::-1]], [heights[::-1], heights[::-1, ::-1]]])
+    spec.add_hfield(name="terrain", size=[20.0, 20.0, 0.05, 1.0], nrow=heights.shape[0], ncol=heights.shape[1], userdata=heights.reshape(-1).tolist())
+    spec.add_texture(name="rocky", type=mujoco.mjtTexture.mjTEXTURE_2D, file=str(TERRAIN_DIR / "rocky_texture.png"))
+    material = spec.add_material(name="rocky", texrepeat=[20.0, 20.0], texuniform=True)
+    material.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "rocky"
+    geom = spec.geom("terrain")
+    geom.type, geom.hfieldname, geom.material, geom.pos = mujoco.mjtGeom.mjGEOM_HFIELD, "terrain", "rocky", [0.0, 0.0, -0.05]
+
+
+def add_rough_terrain(cfg, scan_body: str) -> ObservationTermCfg:
+    cfg.scene.spec_fn = rough_terrain_spec
+    cfg.scene.env_spacing = 0.25
+    cfg.sim.njmax = 1500
+    cfg.sim.nconmax = 70
+    cfg.sim.contact_sensor_maxmatch = 500
+    scanner = RayCastSensorCfg(
+        name="terrain_scan",
+        frame=ObjRef(type="body", name=scan_body, entity="robot"),
+        ray_alignment="yaw",
+        pattern=HEIGHT_SCAN_PATTERN,
+        max_distance=2.0,
+        exclude_parent_body=True,
+        include_geom_groups=(0,),
+    )
+    cfg.scene.sensors = (*(cfg.scene.sensors or ()), scanner)
+    scan = ObservationTermCfg(func=obs_mdp.height_scan, params={"sensor_name": "terrain_scan"})
+    cfg.observations["actor"].terms[HEIGHT_SCAN] = replace(scan, noise=Unoise(n_min=-0.02, n_max=0.02))
+    critic = list(cfg.observations["critic"].terms.items())
+    split = [name for name, _ in critic].index("command") + 1
+    cfg.observations["critic"].terms = dict((*critic[:split], (HEIGHT_SCAN, scan), *critic[split:]))
+    return scan
+
+
+def rough_robot(robot: MbpoRobot, scan_height: float) -> MbpoRobot:
+    n = len(robot.state_mean)
+    return replace(
+        robot,
+        task="Velocity-Rough",
+        experiment=f"{robot.experiment}_rough",
+        state_mean=(*robot.state_mean, *(scan_height,) * NUM_HEIGHT_SCAN),
+        state_std=(*robot.state_std, *(0.05,) * NUM_HEIGHT_SCAN),
+        state_idx={**robot.state_idx, r"$h$\n$[m]$": list(range(n, n + NUM_HEIGHT_SCAN))},
+    )
 
 
 def domain_randomization_enabled() -> bool:
@@ -235,7 +292,6 @@ def add_mbpo_cfg(train_cfg: dict, mode: str, supports_imagination: bool, robot: 
         fisher_fd_delta_floor=0.1,
         fisher_obs_noise_std=0.1,
         info_gain_mode=os.environ.get("QOED_INFO_GAIN", "nothing") if mode == "finetune" else "nothing",
-        info_gain_num_actions=INFO_GAIN_NUM_ACTIONS,
     )
     if train_cfg.get("clip_actions") is not None:
         algorithm["info_gain_clip_actions"] = train_cfg["clip_actions"]
@@ -312,6 +368,7 @@ class MbpoRunner(MBPOOnPolicyRunner):
             architecture_config["privilege_dim"] = privilege_dim
         super().__init__(env, train_cfg, log_dir, device)
         patch_policy_distribution_safety(self.alg.policy)
+        self.alg.exploration_reward = getattr(env.unwrapped, "exploration_reward", None)
         self.imagination_infos = []
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):

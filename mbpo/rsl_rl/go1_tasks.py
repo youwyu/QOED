@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 from mjlab.envs.mdp import observations as obs_mdp
 from mjlab.managers import EventTermCfg
@@ -11,16 +13,19 @@ from mjlab.tasks.velocity.config.go1.rl_cfg import unitree_go1_ppo_runner_cfg
 
 from mbpo.envs.go1.utils import GO1_KD_SCALE, GO1_KP_SCALE, GO1_PAYLOAD, mujoco_actuator_ids_by_joint_type
 from mbpo.rsl_rl.mbpo_tasks import (
+    HEIGHT_SCAN,
     MbpoRobot,
     MbpoRunner,
     add_mbpo_observations,
     add_privilege_observation,
+    add_rough_terrain,
     configure_agent_cfg,
     domain_randomization_enabled,
     joint_effort,
     named_global_id,
     register_tasks,
     resolve_env_ids,
+    rough_robot,
     uniform_like,
     uniform_mean_var,
 )
@@ -157,8 +162,9 @@ def _go1_pretrain_domain_randomize(env, env_ids: torch.Tensor | slice | None) ->
     _go1_payload(env)[env_ids.long()] = payload
 
 
-def _go1_env_cfg(mode: str, play: bool = False):
+def _go1_env_cfg(mode: str, play: bool = False, rough: bool = False):
     cfg = unitree_go1_flat_env_cfg(play=play or mode == "visualize")
+    state_terms = {**_STATE_TERMS, HEIGHT_SCAN: add_rough_terrain(cfg, "trunk")} if rough else _STATE_TERMS
 
     if not play and mode in {"init", "pretrain", "finetune"}:
         cfg.scene.num_envs = 4096
@@ -174,7 +180,7 @@ def _go1_env_cfg(mode: str, play: bool = False):
         cfg.commands["twist"].resampling_time_range = (2.0, 2.0)
 
     if mode in {"pretrain", "finetune", "visualize"}:
-        add_mbpo_observations(cfg, _STATE_TERMS)
+        add_mbpo_observations(cfg, state_terms)
 
     if play:
         cfg.scene.num_envs = 1
@@ -223,14 +229,20 @@ def _go1_robot() -> MbpoRobot:
 
 
 GO1 = _go1_robot()
+GO1_ROUGH = rough_robot(GO1, scan_height=0.28)
 
 
 class Go1MBPOOnPolicyRunner(MbpoRunner):
     robot = GO1
 
 
-def _go1_agent_cfg(mode: str):
-    return configure_agent_cfg(unitree_go1_ppo_runner_cfg(), mode, GO1)
+class Go1RoughMBPOOnPolicyRunner(MbpoRunner):
+    robot = GO1_ROUGH
+
+
+def _go1_agent_cfg(mode: str, robot: MbpoRobot = GO1):
+    return configure_agent_cfg(unitree_go1_ppo_runner_cfg(), mode, robot)
 
 
 register_tasks(GO1, _go1_env_cfg, _go1_agent_cfg, Go1MBPOOnPolicyRunner)
+register_tasks(GO1_ROUGH, partial(_go1_env_cfg, rough=True), partial(_go1_agent_cfg, robot=GO1_ROUGH), Go1RoughMBPOOnPolicyRunner)

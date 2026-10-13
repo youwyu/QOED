@@ -130,7 +130,7 @@ class DirectMujocoLeapVecEnv(DirectMujocoVecEnv):
         plausible = ((joint_pos >= 2 * low - high) & (joint_pos <= 2 * high - low)).all(dim=1) & torch.isfinite(state).all(dim=1)
         return termination | self._cube_dropped(state) | ~plausible
 
-    def _compute_imagination_reward(self, state: torch.Tensor, action: torch.Tensor):
+    def _compute_imagination_reward(self, state: torch.Tensor, action: torch.Tensor, context: dict[str, torch.Tensor] | None = None):
         terms = {"cube_spin": state[:, 44], "termination": self._cube_dropped(state).to(state.dtype)}
         weighted = {name: self._reward_weights[name] * value * self.step_dt for name, value in terms.items()}
         return weighted["cube_spin"] + weighted["termination"], weighted, {"Metrics/cube_spin": terms["cube_spin"]}

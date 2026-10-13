@@ -7,7 +7,7 @@
   </asset>
 
   <default>
-    <geom solref="-200 -50" solimp="0.9 0.95 0.02"/>
+    <geom solref="-200 -50" solimp="0.9 0.95 0.02" group="2"/>
     <default class="throttle">
       <joint type="hinge" axis="0 1 0" frictionloss="0.1" damping="1.0" armature="0.05" limited="false"/>
     </default>

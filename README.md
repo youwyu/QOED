@@ -59,7 +59,7 @@ qoed-franka-demo --device cuda:0 --sweep
 
 #### 2.1 Pretrain in Simulation (ETA: 1 hour)
 
-Optional: train the dynamics model and policy. Pretrained checkpoints are provided under `logs/`. `--task` selects the robot: `go1`, `jackal`, `g1`, or `leap`.
+Optional: train the dynamics model and policy. Pretrained checkpoints are provided under `logs/`. `--task` selects the robot: `go1`, `jackal`, `g1`, or `leap`, and `go1-rough`, `jackal-rough`, or `g1-rough` for rough terrain.
 
 ```bash
 python mbpo/rsl_rl/train.py --task go1 --mode pretrain --gpu-ids "[0, ]" --headless
@@ -81,26 +81,7 @@ python mbpo/rsl_rl/train.py --task go1 --mode finetune --info-gain qoed --gpu-id
 
 Available info-gain modes: `qoed`, `qoed-agnostic`, `boed`, and `nothing`.
 
-<details name="robot" open>
-<summary>Unitree Go1</summary>
-
-![Go1 online learning with QOED, BOED, QOED-Agnostic, and no info gain](mbpo/envs/assets/snapshot/qoed_go1.gif)
-
-</details>
-
-<details name="robot">
-<summary>Clearpath Jackal</summary>
-
-![Jackal online learning with QOED, BOED, QOED-Agnostic, and no info gain](mbpo/envs/assets/snapshot/qoed_jackal.gif)
-
-</details>
-
-<details name="robot">
-<summary>LEAP Hand</summary>
-
-![LEAP Hand online learning with QOED, BOED, QOED-Agnostic, and no info gain](mbpo/envs/assets/snapshot/qoed_leap.gif)
-
-</details>
+![Online learning with QOED, BOED, QOED-Agnostic, and no info gain on Unitree Go1, Unitree G1, Jackal, and LEAP Hand](mbpo/envs/assets/snapshot/qoed_online.webp)
 
 ## Miscell
 Please consider cite our work if it is interesting.

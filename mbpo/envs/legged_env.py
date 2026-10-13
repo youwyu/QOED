@@ -39,6 +39,7 @@ class LeggedVelocityVecEnv(DirectMujocoVecEnv):
         self.contact_force = np.zeros((n, 3), dtype=np.float32)
         self.foot_air_time = np.zeros(n, dtype=np.float32)
         self.peak_foot_height = np.zeros(n, dtype=np.float32)
+        self.foot_height = np.zeros(n, dtype=np.float32)
         self.prev_foot_pos = np.zeros((n, 3), dtype=np.float32)
         self.foot_vel = np.zeros((n, 3), dtype=np.float32)
         self.self_collision = 0.0
@@ -78,11 +79,13 @@ class LeggedVelocityVecEnv(DirectMujocoVecEnv):
         self.foot_air_time[:] = 0.0
         self.peak_foot_height[:] = 0.0
         self.prev_foot_pos[:] = self.data.site_xpos[self.foot_site_ids].astype(np.float32)
+        self.foot_height[:] = self.prev_foot_pos[:, 2] - self.backend.terrain_height(self.prev_foot_pos)
         self.foot_vel[:] = 0.0
         self.self_collision = 0.0
 
     def _after_physics_step(self) -> None:
         current_pos = self.data.site_xpos[self.foot_site_ids].astype(np.float32)
+        self.foot_height[:] = current_pos[:, 2] - self.backend.terrain_height(current_pos)
         self.foot_vel[:] = (current_pos - self.prev_foot_pos) / self.step_dt
         self.prev_foot_pos[:] = current_pos
         self.prev_contact[:] = self.contact
@@ -104,7 +107,7 @@ class LeggedVelocityVecEnv(DirectMujocoVecEnv):
             mujoco.mj_contactForce(self.model, self.data, contact_id, force6)
             self.contact_force[foot] += force6[:3].astype(np.float32)
         self.foot_air_time[:] = np.where(self.contact, 0.0, self.foot_air_time + self.step_dt)
-        self.peak_foot_height[:] = np.where(self.contact, self.peak_foot_height, np.maximum(self.peak_foot_height, current_pos[:, 2]))
+        self.peak_foot_height[:] = np.where(self.contact, self.peak_foot_height, np.maximum(self.peak_foot_height, self.foot_height))
 
     def _upright_gravity(self) -> np.ndarray:
         rotation = self.data.xmat[self._upright_body_id].reshape(3, 3)
@@ -117,7 +120,7 @@ class LeggedVelocityVecEnv(DirectMujocoVecEnv):
         critic = np.concatenate(
             (
                 actor,
-                self.data.site_xpos[self.foot_site_ids, 2].astype(np.float32),
+                self.foot_height,
                 self.foot_air_time.astype(np.float32),
                 foot_contact,
                 (np.sign(self.contact_force) * np.log1p(np.abs(self.contact_force))).reshape(-1).astype(np.float32),
@@ -127,6 +130,7 @@ class LeggedVelocityVecEnv(DirectMujocoVecEnv):
         parts = [self.backend.root_velocity(), actor[6 : 9 + 2 * nj]]
         if self.include_torque:
             parts.append(self.backend.actuator_force())
+        parts.append(actor[actor.shape[0] - self.backend.num_scan :])
         return {
             "actor": torch.from_numpy(actor).view(1, -1),
             "policy": torch.from_numpy(actor.copy()).view(1, -1),
@@ -146,7 +150,7 @@ class LeggedVelocityVecEnv(DirectMujocoVecEnv):
         upright_gravity = self._upright_gravity()
         body_velocity = np.zeros(6)
         mujoco.mj_objectVelocity(self.model, self.data, mujoco.mjtObj.mjOBJ_BODY, self._upright_body_id, body_velocity, 0)
-        foot_height = self.data.site_xpos[self.foot_site_ids, 2].astype(np.float32)
+        foot_height = self.foot_height
         slip_speed = np.linalg.norm(self.foot_vel[:, :2], axis=1)
         first_contact = (self.contact & ~self.prev_contact).astype(np.float32)
         contact = self.contact.astype(np.float32)
@@ -185,7 +189,8 @@ class LeggedVelocityVecEnv(DirectMujocoVecEnv):
 
     def _imagination_obs_from_state(self, state: torch.Tensor, action: torch.Tensor, termination: torch.Tensor | None = None) -> TensorDict:
         num_envs, n, nj = state.shape[0], len(self.feet), len(self.backend.obs_joint_names)
-        actor = torch.cat((state[:, : 9 + 2 * nj], action, self._imagination_command.to(device=state.device, dtype=state.dtype)), dim=-1)
+        command = self._imagination_command.to(device=state.device, dtype=state.dtype)
+        actor = torch.cat((state[:, : 9 + 2 * nj], action, command, state[:, state.shape[1] - self.backend.num_scan :]), dim=-1)
         foot_contact = self._imagination_contact.to(device=state.device, dtype=state.dtype)
         zeros = torch.zeros(num_envs, n, device=state.device, dtype=state.dtype)
         critic = torch.cat((actor, zeros, self._imagination_air_time.to(device=state.device, dtype=state.dtype), foot_contact, zeros.repeat(1, 3)), dim=-1)
@@ -222,17 +227,24 @@ class LeggedVelocityVecEnv(DirectMujocoVecEnv):
         plausible = ((joint_pos >= 2 * low - high) & (joint_pos <= 2 * high - low)).all(dim=1) & torch.isfinite(state).all(dim=1)
         return termination | bad_orientation | ~plausible
 
-    def _compute_imagination_reward(self, state: torch.Tensor, action: torch.Tensor):
+    def _imagination_reward_context(self) -> dict[str, torch.Tensor]:
+        return {**super()._imagination_reward_context(), "air_time": self._imagination_air_time}
+
+    def _real_reward_context(self) -> dict[str, np.ndarray]:
+        return {**super()._real_reward_context(), "air_time": self.foot_air_time}
+
+    def _compute_imagination_reward(self, state: torch.Tensor, action: torch.Tensor, context: dict[str, torch.Tensor] | None = None):
+        context = context or self._imagination_reward_context()
         nj = len(self.backend.obs_joint_names)
         lin_vel, ang_vel, gravity = state[:, 0:3], state[:, 3:6], state[:, 6:9]
         joint_pos = state[:, 9 : 9 + nj] + torch.as_tensor(self.backend.default_joint_pos, device=state.device, dtype=state.dtype)
-        command = self._imagination_command.to(device=state.device, dtype=state.dtype)
+        command = context["command"].to(device=state.device, dtype=state.dtype)
         command_norm = torch.linalg.norm(command[:, :2], dim=1) + command[:, 2].abs()
         active = (command_norm > 0.05).to(state.dtype)
         std = torch.as_tensor(self._pose_std, device=state.device, dtype=state.dtype)[self._pose_tier(command_norm)]
         limits = torch.as_tensor(self._joint_limits, device=state.device, dtype=state.dtype)
-        previous_action = self._imagination_last_action.to(device=state.device, dtype=state.dtype)
-        air_time = self._imagination_air_time.to(device=state.device, dtype=state.dtype)
+        previous_action = context["previous_action"].to(device=state.device, dtype=state.dtype)
+        air_time = context["air_time"].to(device=state.device, dtype=state.dtype)
         zero = torch.zeros(state.shape[0], device=state.device, dtype=state.dtype)
         raw_terms = {
             "track_linear_velocity": torch.exp(-(torch.sum((command[:, :2] - lin_vel[:, :2]) ** 2, dim=1) + lin_vel[:, 2] ** 2) / self._reward_variance["track_linear_velocity"]),

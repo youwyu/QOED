@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import math
 from dataclasses import dataclass
 
@@ -39,14 +41,17 @@ from mbpo.envs.jackal.utils import (
     jackal_ids,
 )
 from mbpo.rsl_rl.mbpo_tasks import (
+    HEIGHT_SCAN,
     MbpoRobot,
     MbpoRunner,
     add_mbpo_observations,
     add_privilege_observation,
+    add_rough_terrain,
     configure_agent_cfg,
     domain_randomization_enabled,
     register_tasks,
     resolve_env_ids,
+    rough_robot,
     uniform_like,
     uniform_mean_var,
 )
@@ -216,8 +221,9 @@ def _jackal_base_env_cfg() -> ManagerBasedRlEnvCfg:
     )
 
 
-def _jackal_env_cfg(mode: str, play: bool = False):
+def _jackal_env_cfg(mode: str, play: bool = False, rough: bool = False):
     cfg = _jackal_base_env_cfg()
+    state_terms = {**_STATE_TERMS, HEIGHT_SCAN: add_rough_terrain(cfg, "base_link")} if rough else _STATE_TERMS
 
     if not play and mode in {"init", "pretrain", "finetune"}:
         cfg.scene.num_envs = 4096
@@ -232,7 +238,7 @@ def _jackal_env_cfg(mode: str, play: bool = False):
         cfg.commands["twist"].resampling_time_range = (2.0, 2.0)
 
     if mode in {"pretrain", "finetune", "visualize"}:
-        add_mbpo_observations(cfg, _STATE_TERMS)
+        add_mbpo_observations(cfg, state_terms)
 
     if play:
         cfg.scene.num_envs = 1
@@ -282,14 +288,20 @@ def _jackal_robot() -> MbpoRobot:
 
 
 JACKAL = _jackal_robot()
+JACKAL_ROUGH = rough_robot(JACKAL, scan_height=0.07)
 
 
 class JackalMBPOOnPolicyRunner(MbpoRunner):
     robot = JACKAL
 
 
-def _jackal_agent_cfg(mode: str):
-    return configure_agent_cfg(unitree_go1_ppo_runner_cfg(), mode, JACKAL)
+class JackalRoughMBPOOnPolicyRunner(MbpoRunner):
+    robot = JACKAL_ROUGH
+
+
+def _jackal_agent_cfg(mode: str, robot: MbpoRobot = JACKAL):
+    return configure_agent_cfg(unitree_go1_ppo_runner_cfg(), mode, robot)
 
 
 register_tasks(JACKAL, _jackal_env_cfg, _jackal_agent_cfg, JackalMBPOOnPolicyRunner)
+register_tasks(JACKAL_ROUGH, partial(_jackal_env_cfg, rough=True), partial(_jackal_agent_cfg, robot=JACKAL_ROUGH), JackalRoughMBPOOnPolicyRunner)
