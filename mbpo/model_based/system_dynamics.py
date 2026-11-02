@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from rsl_rl.algorithms import MBPOPPO
 from rsl_rl.modules import SystemDynamicsEnsemble
 from rsl_rl.storage.replay_buffer import ReplayBuffer as _RslReplayBuffer
 
 from boed.fisher import FisherEstimator, ParameterDistribution
 from boed.objectives import VALID_MODES, score_from_mask
-from mbpo.neural import FlowDynamics
+from mbpo.neural import FlowDynamics, MLPDynamics
 
 INFO_GAIN_NOTHING = "nothing"
 LOSS_NAMES = ("state", "sequence", "bound", "kl", "extension", "contact", "termination")
@@ -80,7 +83,7 @@ class ReplayBuffer(_RslReplayBuffer):
 
 def build_system_dynamics(*args, architecture_config: dict | None = None, **kwargs):
     architecture_config = architecture_config or {}
-    cls = ShortcutSystemDynamicsEnsemble if architecture_config.get("type") == "shortcut" else SystemDynamicsEnsemble
+    cls = PrivilegedSystemDynamicsEnsemble if architecture_config.get("type") in {"shortcut", "mlp"} else SystemDynamicsEnsemble
     return cls(*args, architecture_config=architecture_config, **kwargs)
 
 
@@ -111,6 +114,8 @@ class QOED_MBPOPPO(MBPOPPO):
         fisher_obs_noise_std: float = 0.025,
         info_gain_mode: str = INFO_GAIN_NOTHING,
         info_gain_clip_actions: float | None = None,
+        bptt_horizon: int = 0,
+        bptt_updates: int = 4,
         **kwargs,
     ):
         if info_gain_mode not in (*VALID_MODES, INFO_GAIN_NOTHING):
@@ -120,8 +125,16 @@ class QOED_MBPOPPO(MBPOPPO):
         self.cumulative_info_gain = 0.0
         self.num_info_gain_selections = 0
         self.exploration_reward = None
+        self.bptt_horizon = int(bptt_horizon)
+        self.bptt_updates = int(bptt_updates)
+        self.bptt_losses = {}
+        self.reference_actor = None
         self.latest_system_dynamics_autoregressive_error = None
         super().__init__(*args, **kwargs)
+        if self.bptt_horizon > 0:
+            self.bptt_learning_rate = 2.0e-4
+            self.actor_optimizer = torch.optim.Adam(self.policy.actor.parameters(), lr=self.bptt_learning_rate, betas=(0.9, 0.95))
+            self.critic_optimizer = torch.optim.Adam(self.policy.critic.parameters(), lr=2.0e-4)
 
         self._fisher_prev_state = None
         self._fisher_prev_valid = None
@@ -195,46 +208,137 @@ class QOED_MBPOPPO(MBPOPPO):
         self.transition.observations = obs
         return self.transition.actions
 
-    def _info_gain_scores(self, state: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.info_gain_clip_actions is not None:
-            actions = actions.clamp(-self.info_gain_clip_actions, self.info_gain_clip_actions)
-        estimator = self.parameter_estimator
-        theta = estimator.dist.mean.reshape(-1)
-        p = theta.numel()
-        eps = estimator.fd_eps * (theta.abs() + estimator.fd_delta_floor)
-        offsets = torch.eye(p, device=theta.device, dtype=theta.dtype) * eps[:, None]
-        thetas = torch.cat((theta + offsets, theta - offsets)).repeat(actions.shape[0], 1)
-        repeated = actions.repeat_interleave(2 * p, dim=0)
+    def _info_gain_score(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        estimator, adapter = self.parameter_estimator, self.parameter_estimator.dyn
+        theta = estimator.dist.mean.reshape(1, -1).expand(action.shape[0], -1).clone().requires_grad_(True)
+        privilege = adapter.privilege.clone().expand(action.shape[0], -1).index_copy(1, adapter.index, theta * adapter.scale.clone())
+        next_state = self.system_dynamics.forward(state.unsqueeze(1), self.action_normalizer(action).unsqueeze(1), privilege_batch=privilege)[0]
+        rewards = self.exploration_reward(self.state_normalizer.inverse(next_state), action)
+        jacobian = torch.stack(
+            [torch.autograd.grad(reward.sum(), theta, create_graph=True, allow_unused=True, materialize_grads=True)[0] for reward in rewards.unbind(-1)], dim=1
+        )
+        fisher = jacobian.transpose(1, 2) @ jacobian
+        fisher = fisher / fisher.diagonal(dim1=-2, dim2=-1).mean().detach().clamp_min(1.0e-12)
+        return score_from_mask(fisher, fisher.diagonal(dim1=-2, dim2=-1).sum(-1), self.info_gain_mode, estimator.mask(self.info_gain_mode))
+
+    def _clip_info_gain_action(self, action: torch.Tensor) -> torch.Tensor:
+        return action if self.info_gain_clip_actions is None else action.clamp(-self.info_gain_clip_actions, self.info_gain_clip_actions)
+
+    def _select_info_gain_action(self, obs, sample: torch.Tensor) -> torch.Tensor:
+        system_state = self.state_normalizer(obs["system_state"].to(self.device))
+        mean = self.policy.action_mean.detach().to(self.device)
         was_training = self.system_dynamics.training
         self.system_dynamics.eval()
-        with torch.no_grad():
-            next_state = self.state_normalizer.inverse(estimator.dyn.step(state.expand(thetas.shape[0], -1), self.action_normalizer(repeated), thetas))
-            rewards = self.exploration_reward(next_state, repeated).reshape(actions.shape[0], 2, p, -1)
-        self.system_dynamics.train(was_training)
-        jacobian = (rewards[:, 0] - rewards[:, 1]).transpose(1, 2) / (2.0 * eps)
-        fisher = jacobian.transpose(1, 2) @ jacobian
-        fisher = fisher / fisher.diagonal(dim1=-2, dim2=-1).mean().clamp_min(1.0e-12)
-        scores = score_from_mask(fisher, fisher.diagonal(dim1=-2, dim2=-1).sum(-1), self.info_gain_mode, estimator.mask(self.info_gain_mode))
-        return actions, torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _select_info_gain_action(self, obs, fallback_action: torch.Tensor) -> torch.Tensor:
-        system_state = self.state_normalizer(obs["system_state"].to(self.device))
-        mean, std = self.policy.action_mean.detach().to(self.device), self.policy.action_std.detach().to(self.device)
-        dim = mean.shape[-1]
-        probes = torch.cat((torch.eye(dim, device=self.device), -torch.eye(dim, device=self.device)))
         selected = []
         for env_idx in range(mean.shape[0]):
-            state = system_state[env_idx : env_idx + 1]
-            _, scores = self._info_gain_scores(state, mean[env_idx] + probes * std[env_idx])
-            gradient = scores[:dim] - scores[dim:]
-            if not gradient.any():
-                selected.append(fallback_action[env_idx].to(self.device))
-                continue
-            action, score = self._info_gain_scores(state, (mean[env_idx] + std[env_idx] * torch.sign(gradient))[None])
-            self.cumulative_info_gain = self.cumulative_info_gain + score[0]
+            with torch.inference_mode(False), torch.enable_grad():
+                action = self._clip_info_gain_action(mean[env_idx : env_idx + 1].clone()).requires_grad_(True)
+                score = self._info_gain_score(system_state[env_idx : env_idx + 1].clone(), action)
+                gradient = torch.nan_to_num(torch.autograd.grad(score.sum(), action, allow_unused=True, materialize_grads=True)[0][0])
+            deviation = sample[env_idx].to(self.device) - mean[env_idx]
+            self.cumulative_info_gain = self.cumulative_info_gain + torch.nan_to_num(score.detach()[0])
             self.num_info_gain_selections += 1
-            selected.append(action[0])
-        return torch.stack(selected, dim=0).to(device=fallback_action.device, dtype=fallback_action.dtype)
+            selected.append(self._clip_info_gain_action(mean[env_idx] + torch.where((gradient * deviation).sum() < 0, -deviation, deviation)))
+        self.system_dynamics.train(was_training)
+        return torch.stack(selected, dim=0).to(device=sample.device, dtype=sample.dtype)
+
+    def update(self, imagination=False):
+        if self.bptt_horizon <= 0:
+            return super().update(imagination)
+        return {**super().update(False), **{f"bptt_{name}": value for name, value in self.bptt_losses.items()}}
+
+    def bptt_update(self, env) -> tuple[torch.Tensor, torch.Tensor]:
+        model = self.system_dynamics.models[0]
+        model.requires_grad_(False)
+        if self.reference_actor is None:
+            self.reference_actor = copy.deepcopy(self.policy.actor).requires_grad_(False)
+        state_scale, action_scale = env.imagination_state_normalizer, env.imagination_action_normalizer
+
+        def observe(state, previous):
+            return env._imagination_obs_from_state(state_scale.inverse(state), action_scale.inverse(previous))
+
+        def transition(state, previous, privilege):
+            action = self.policy.act_inference(observe(state, previous))
+            next_state = model(state, self.action_normalizer(action), privilege)
+            env._imagination_last_action = action_scale.inverse(previous).detach()
+            return next_state, self.action_normalizer(action), env._compute_imagination_reward(state_scale.inverse(next_state), action)[0]
+
+        actor_loss = critic_loss = 0.0
+        for _ in range(self.bptt_updates):
+            state_history, action_history = self.prepare_imagination()
+            state, previous = state_history[:, -1].to(self.device), action_history[:, -1].to(self.device)
+            env._reset_imagination_indices(torch.arange(state.shape[0], device=state.device))
+            privilege = self.system_dynamics._privilege(state.shape[0], state)
+            survival = torch.ones(state.shape[0], device=self.device)
+            imagined_return = torch.zeros_like(survival)
+            trajectory, rewards, continues = [(state, previous)], [], []
+            for step in range(self.bptt_horizon):
+                state, previous, reward = checkpoint(transition, state, previous, privilege, use_reentrant=False)
+                alive = (~env._parse_imagination_termination(None, state_scale.inverse(state).detach())).to(reward.dtype)
+                imagined_return = imagined_return + self.gamma**step * survival * reward
+                survival = survival * alive
+                trajectory.append((state.detach(), previous.detach()))
+                rewards.append(reward.detach())
+                continues.append(alive)
+            imagined_return = imagined_return + self.gamma**self.bptt_horizon * survival * self.policy.evaluate(observe(state, previous)).squeeze(-1)
+            with torch.no_grad():
+                observations = [observe(*pair) for pair in trajectory]
+            actor_obs = torch.cat([self.policy.get_actor_obs(obs).detach() for obs in observations[:-1]])
+            with torch.no_grad():
+                old_mean = self.policy.actor(actor_obs)
+                reference_mean = self.reference_actor(actor_obs)
+            loss = -imagined_return.mean() + self._policy_kl(self.policy.actor(actor_obs), reference_mean)
+            self.actor_optimizer.zero_grad()
+            if not torch.isfinite(loss):
+                continue
+            loss.backward()
+            if not torch.isfinite(nn.utils.clip_grad_norm_(self.policy.actor.parameters(), 1.0)):
+                self.actor_optimizer.zero_grad()
+                continue
+            for parameter in self.policy.actor.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.clamp_(-0.1, 0.1)
+            self.actor_optimizer.step()
+            self._adapt_bptt_learning_rate(actor_obs, old_mean)
+            actor_loss += loss.item()
+            critic_loss += self._fit_critic([obs.detach() for obs in observations], rewards, continues)
+        model.requires_grad_(True)
+        self.bptt_losses = {"value_function": critic_loss / self.bptt_updates, "surrogate": actor_loss / self.bptt_updates, "entropy": 0.0}
+        return torch.stack([obs["policy"].detach() for obs in observations]), imagined_return.detach()
+
+    def _policy_kl(self, mean: torch.Tensor, reference_mean: torch.Tensor) -> torch.Tensor:
+        std = (self.policy.log_std.exp() if self.policy.noise_std_type == "log" else self.policy.std).detach()
+        return (0.5 * ((mean - reference_mean) / std).square().sum(-1)).mean()
+
+    def _adapt_bptt_learning_rate(self, actor_obs: torch.Tensor, old_mean: torch.Tensor) -> None:
+        with torch.no_grad():
+            kl = self._policy_kl(self.policy.actor(actor_obs), old_mean)
+        if kl > 2.0 * self.desired_kl:
+            self.bptt_learning_rate = max(1.0e-5, self.bptt_learning_rate / 1.5)
+        elif kl < 0.5 * self.desired_kl:
+            self.bptt_learning_rate = min(1.0e-2, self.bptt_learning_rate * 1.5)
+        for group in self.actor_optimizer.param_groups:
+            group["lr"] = self.bptt_learning_rate
+
+    def _fit_critic(self, observations, rewards, continues) -> float:
+        with torch.no_grad():
+            values = torch.stack([self.policy.evaluate(obs).squeeze(-1) for obs in observations])
+            target, targets = values[-1], []
+            for step in reversed(range(len(rewards))):
+                target = rewards[step] + self.gamma * continues[step] * ((1.0 - self.lam) * values[step + 1] + self.lam * target)
+                targets.append(target)
+            targets = torch.stack(targets[::-1]).flatten()
+            critic_obs = torch.cat([self.policy.get_critic_obs(obs) for obs in observations[:-1]])
+        total = 0.0
+        for _ in range(5):
+            for index in torch.randperm(targets.numel(), device=targets.device).chunk(4):
+                loss = (self.policy.critic(critic_obs[index]).squeeze(-1) - targets[index]).square().mean()
+                self.critic_optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.critic.parameters(), 1.0)
+                self.critic_optimizer.step()
+                total += loss.item()
+        return total / 20
 
     def _is_imagination_observation(self, obs) -> bool:
         imagination_storage = getattr(self, "imagination_storage", None)
@@ -251,7 +355,8 @@ class QOED_MBPOPPO(MBPOPPO):
         if self.parameter_estimator is None or self.info_gain_mode == INFO_GAIN_NOTHING:
             return prior.mean, prior.cov
         dist, idx, s = self.parameter_estimator.dist, self._fisher_index, self._fisher_scale
-        cov = torch.zeros_like(prior.cov).index_put((idx[:, None], idx), dist.cov * s[:, None] * s[None])
+        critical = self.parameter_estimator.mask(self.info_gain_mode).to(dist.cov)
+        cov = torch.zeros_like(prior.cov).index_put((idx[:, None], idx), dist.cov * (critical * s)[:, None] * (critical * s)[None])
         return prior.mean.index_copy(0, idx, dist.mean * s), cov
 
     def effective_system_privilege_mean(self) -> torch.Tensor | None:
@@ -453,8 +558,8 @@ class QOED_MBPOPPO(MBPOPPO):
         return low
 
 
-class ShortcutSystemDynamicsEnsemble(nn.Module):
-    """shortcut dynamics ensemble with the RSL-RL system dynamics interface."""
+class PrivilegedSystemDynamicsEnsemble(nn.Module):
+    """Privilege-conditioned flow or MLP dynamics ensemble with the RSL-RL system dynamics interface."""
 
     def __init__(
         self,
@@ -493,24 +598,25 @@ class ShortcutSystemDynamicsEnsemble(nn.Module):
         condition_dim = self.shortcut_privilege_dim
         if self.shortcut_privilege_dim > 0 and self.shortcut_privilege_availability:
             condition_dim += 1
-        self.models = nn.ModuleList(
-            [
-                FlowDynamics(
-                    state_dim,
-                    action_dim,
-                    condition_dim,
-                    latent_dim=int(cfg.get("latent_dim", state_dim)),
-                    timestep_embed_dim=cfg.get("timestep_embed_dim"),
-                    use_shortcut=bool(cfg.get("use_shortcut", True)),
-                    shortcut_self_consistency=float(cfg.get("shortcut_self_consistency", 0.25)),
-                    shortcut_min_dt=float(cfg.get("shortcut_min_dt", 0.0078125)),
-                    depth=int(cfg.get("depth", 6)),
-                    num_heads=int(cfg.get("num_heads", 4)),
-                    mlp_ratio=float(cfg.get("mlp_ratio", 4.0)),
-                    num_registers=int(cfg.get("num_registers", 8)),
-                )
-                for _ in range(ensemble_size)
-            ]
+        self.models = nn.ModuleList([self._build_model(state_dim, action_dim, condition_dim, cfg) for _ in range(ensemble_size)])
+
+    @staticmethod
+    def _build_model(state_dim: int, action_dim: int, condition_dim: int, cfg: dict) -> nn.Module:
+        if cfg.get("type") == "mlp":
+            return MLPDynamics(state_dim, action_dim, condition_dim, hidden_dims=tuple(cfg.get("hidden_dims", (1024, 1024, 1024))))
+        return FlowDynamics(
+            state_dim,
+            action_dim,
+            condition_dim,
+            latent_dim=int(cfg.get("latent_dim", state_dim)),
+            timestep_embed_dim=cfg.get("timestep_embed_dim"),
+            use_shortcut=bool(cfg.get("use_shortcut", True)),
+            shortcut_self_consistency=float(cfg.get("shortcut_self_consistency", 0.25)),
+            shortcut_min_dt=float(cfg.get("shortcut_min_dt", 0.0078125)),
+            depth=int(cfg.get("depth", 6)),
+            num_heads=int(cfg.get("num_heads", 4)),
+            mlp_ratio=float(cfg.get("mlp_ratio", 4.0)),
+            num_registers=int(cfg.get("num_registers", 8)),
         )
 
     def set_source_privilege_distribution(self, mean, cov, param_min=None, param_max=None) -> None:

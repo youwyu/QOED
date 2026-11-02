@@ -348,3 +348,27 @@ class FlowDynamics(nn.Module):
         action = self._feature(action, batch, self.action_dim, state.device, state.dtype)
         privilege = self._feature(privilege, batch, self.privilege_dim, state.device, state.dtype)
         return self.model.loss(next_state, state, action, privilege)
+
+
+class MLPDynamics(nn.Module):
+    """Deterministic residual MLP dynamics, cheap to differentiate through imagined rollouts."""
+
+    def __init__(self, state_dim: int, action_dim: int, privilege_dim: int, *, hidden_dims: tuple[int, ...] = (1024, 1024, 1024)):
+        super().__init__()
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.privilege_dim = int(privilege_dim)
+        layers, width = [], self.state_dim + self.action_dim + self.privilege_dim
+        for hidden in hidden_dims:
+            layers += [nn.Linear(width, hidden), nn.ELU()]
+            width = hidden
+        self.net = nn.Sequential(*layers, nn.Linear(width, self.state_dim))
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor | None = None, privilege: torch.Tensor | None = None, n_step: int = 1, noise: torch.Tensor | None = None) -> torch.Tensor:
+        batch = state.shape[0]
+        state = state.reshape(batch, self.state_dim)
+        features = (FlowDynamics._feature(x, batch, dim, state.device, state.dtype) for x, dim in ((action, self.action_dim), (privilege, self.privilege_dim)))
+        return state + self.net(torch.cat((state, *(f for f in features if f is not None)), dim=-1))
+
+    def loss(self, next_state: torch.Tensor, state: torch.Tensor, action: torch.Tensor | None = None, privilege: torch.Tensor | None = None) -> torch.Tensor:
+        return F.mse_loss(self(state, action, privilege), next_state.reshape(state.shape[0], self.state_dim))

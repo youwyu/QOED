@@ -1,6 +1,6 @@
 seed: 42
 num_steps_per_env: 24
-max_iterations: 4000
+max_iterations: 8000
 obs_groups:
   actor: !!python/tuple
   - actor

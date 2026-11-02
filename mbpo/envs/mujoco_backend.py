@@ -201,6 +201,7 @@ class PureMujocoModel:
         self.scan_offsets = scanner.pattern.generate_rays(None, "cpu")[0].numpy().astype(np.float64) if self.rough else np.zeros((0, 3))
         self.scan_max_distance = float(scanner.max_distance) if self.rough else 0.0
         self.num_scan = len(self.scan_offsets)
+        self.minimum_root_height = next((float(term.params["minimum_height"]) for term in env_cfg.terminations.values() if term is not None and term.func.__name__ == "root_height_below_minimum"), None)
         self._ray_geom = np.zeros(1, dtype=np.int32)
         self.reset()
 
@@ -292,7 +293,8 @@ class PureMujocoModel:
     def is_fallen(self) -> bool:
         projected_gravity = self.projected_gravity()
         angle = np.arccos(np.clip(-float(projected_gravity[2]), -1.0, 1.0))
-        return bool(angle > np.deg2rad(70.0))
+        collapsed = self.minimum_root_height is not None and float(self.data.qpos[2]) < self.minimum_root_height
+        return bool(angle > np.deg2rad(70.0) or collapsed)
 
     def set_active_color(self, active: bool) -> None:
         if self.robot_geom_ids:

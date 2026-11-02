@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -29,7 +30,7 @@ SYSTEM_DYNAMICS = {
     "ensemble_size": 1,
     "history_horizon": 32,
     "architecture_config": {
-        "type": "shortcut",
+        "type": "mlp",
         "latent_dim": 128,
         "timestep_embed_dim": 64,
         "depth": 6,
@@ -68,6 +69,7 @@ class MbpoRobot:
     finetune_steps: int = 100
     pretrain_iterations: int = 1000
     task: str = "Velocity-Flat"
+    minimum_root_height: float | None = None
 
     @property
     def mode_tasks(self) -> dict[str, str]:
@@ -282,6 +284,9 @@ def patch_policy_distribution_safety(policy) -> None:
 
 def add_mbpo_cfg(train_cfg: dict, mode: str, supports_imagination: bool, robot: MbpoRobot) -> dict:
     train_cfg["system_dynamics"] = deepcopy(SYSTEM_DYNAMICS)
+    architecture = train_cfg["system_dynamics"]["architecture_config"]
+    architecture["type"] = os.environ.get("QOED_DYNAMICS", architecture["type"])
+    differentiable = architecture["type"] == "mlp"
     algorithm = train_cfg.setdefault("algorithm", {})
     algorithm.update(
         fisher_param_min=list(robot.privilege_low),
@@ -292,6 +297,7 @@ def add_mbpo_cfg(train_cfg: dict, mode: str, supports_imagination: bool, robot: 
         fisher_fd_delta_floor=0.1,
         fisher_obs_noise_std=0.1,
         info_gain_mode=os.environ.get("QOED_INFO_GAIN", "nothing") if mode == "finetune" else "nothing",
+        bptt_horizon=32 if differentiable and mode == "finetune" else 0,
     )
     if train_cfg.get("clip_actions") is not None:
         algorithm["info_gain_clip_actions"] = train_cfg["clip_actions"]
@@ -320,7 +326,7 @@ def add_mbpo_cfg(train_cfg: dict, mode: str, supports_imagination: bool, robot: 
     return train_cfg
 
 
-def checkpoint_privilege_dim(checkpoint_path: str | None, architecture_config: dict) -> int | None:
+def checkpoint_privilege_dim(checkpoint_path: str | None, architecture_config: dict, input_dim: int) -> int | None:
     if checkpoint_path is None:
         return None
     path = Path(checkpoint_path).expanduser()
@@ -331,10 +337,12 @@ def checkpoint_privilege_dim(checkpoint_path: str | None, architecture_config: d
     state_dict = torch.load(path, weights_only=False, map_location="cpu").get("system_dynamics_state_dict")
     if not isinstance(state_dict, dict):
         return None
+    availability = int(architecture_config.get("privilege_availability_feature", True))
     for key, tensor in state_dict.items():
         if key.endswith("model.flow.privilege_encoder.0.weight") and tensor.ndim == 2:
-            condition_dim = int(tensor.shape[1]) - int(architecture_config.get("privilege_availability_feature", True))
-            return max(condition_dim, 0)
+            return max(int(tensor.shape[1]) - availability, 0)
+        if key.endswith("models.0.net.0.weight") and tensor.ndim == 2:
+            return max(int(tensor.shape[1]) - input_dim - availability, 0)
     return None
 
 
@@ -359,7 +367,7 @@ class MbpoRunner(MBPOOnPolicyRunner):
         train_cfg = normalize_mjlab_rsl_rl_cfg(train_cfg, mbpo=True)
         train_cfg = add_mbpo_cfg(train_cfg, self.qoed_mode, supports_imagination, self.robot)
         architecture_config = train_cfg["system_dynamics"]["architecture_config"]
-        privilege_dim = checkpoint_privilege_dim(train_cfg.get("system_dynamics_load_path"), architecture_config)
+        privilege_dim = checkpoint_privilege_dim(train_cfg.get("system_dynamics_load_path"), architecture_config, len(self.robot.state_mean) + self.robot.action_dim)
         if privilege_dim is None and hasattr(env, "get_observations"):
             privilege_obs = env.get_observations().get(SYSTEM_PRIVILEGE_OBS_KEY)
             if privilege_obs is not None:
@@ -370,6 +378,16 @@ class MbpoRunner(MBPOOnPolicyRunner):
         patch_policy_distribution_safety(self.alg.policy)
         self.alg.exploration_reward = getattr(env.unwrapped, "exploration_reward", None)
         self.imagination_infos = []
+
+    def imagine(self):
+        if self.alg.bptt_horizon <= 0:
+            return super().imagine()
+        start = time.time()
+        observations, returns = self.alg.bptt_update(self.env.unwrapped)
+        self.imagination_rewbuffer.extend(returns.tolist())
+        self.imagination_lenbuffer.extend([float(self.alg.bptt_horizon)] * returns.numel())
+        zero = torch.zeros((), device=self.device)
+        return self.alg.storage.observations["policy"], observations, returns.numel(), zero, [], self.imagination_rewbuffer, self.imagination_lenbuffer, time.time() - start
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         if os.environ.get("QOED_FINETUNE") == "1":
@@ -480,6 +498,8 @@ def finetune_env_cfg(cfg, robot: MbpoRobot):
         cfg.terminations["time_out"].time_out = True
     else:
         cfg.terminations["time_out"] = TerminationTermCfg(func=term_mdp.time_out, time_out=True)
+    if robot.minimum_root_height is not None:
+        cfg.terminations["root_height"] = TerminationTermCfg(func=term_mdp.root_height_below_minimum, params={"minimum_height": robot.minimum_root_height})
     return cfg
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 
 import torch
@@ -166,11 +167,12 @@ def _g1_robot() -> MbpoRobot:
         prior_mean=means,
         prior_var=variances,
         pretrain_iterations=4000,
+        minimum_root_height=0.4,
     )
 
 
 G1 = _g1_robot()
-G1_ROUGH = rough_robot(G1, scan_height=0.76)
+G1_ROUGH = replace(rough_robot(G1, scan_height=0.76), pretrain_iterations=8000)
 
 
 class G1MBPOOnPolicyRunner(MbpoRunner):
